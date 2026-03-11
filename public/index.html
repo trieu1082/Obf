@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Trieu Obfuscator</title>
+
+<style>
+
+body{
+background:#0e0e0e;
+color:white;
+font-family:sans-serif;
+text-align:center
+}
+
+textarea{
+width:80%;
+height:300px;
+background:#111;
+color:#0f0;
+border:1px solid #333;
+padding:10px
+}
+
+button{
+padding:10px 20px;
+background:#00ff88;
+border:none;
+cursor:pointer;
+margin:10px
+}
+
+a{
+color:#00ff88
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h2>Trieu Lua Obfuscator</h2>
+
+<textarea id="code"></textarea><br>
+
+<input type="file" id="file">
+
+<br>
+
+<button onclick="obf()">OBF</button>
+
+<p id="links"></p>
+
+<script>
+
+async function obf(){
+
+let code=document.getElementById("code").value
+let file=document.getElementById("file").files[0]
+
+let fd=new FormData()
+
+if(file) fd.append("file",file)
+else fd.append("code",code)
+
+let r=await fetch("/obf",{method:"POST",body:fd})
+
+let d=await r.json()
+
+document.getElementById("code").value=d.code
+
+document.getElementById("links").innerHTML=
+`
+download: <a href="${d.download}" target="_blank">${d.download}</a><br>
+view link: <a href="${d.link}" target="_blank">${d.link}</a>
+`
+
+}
+
+</script>
+
+</body>
+</html>
