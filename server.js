@@ -50,9 +50,6 @@ app.get("/view/:id",(req,res)=>{
  res.send(`
  <pre style="white-space:pre-wrap;font-family:monospace;background:#0f0f0f;color:#0f0;padding:20px">
 ${code.replaceAll("<","&lt;")}
- </pre>
- `)
-
-})
-
-app.listen(3000,()=>console.log("obf web running"))
+ </
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log("server running"))
