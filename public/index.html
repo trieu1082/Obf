@@ -1,83 +1,386 @@
 <!DOCTYPE html>
-<html>
+<html lang="vi">
 <head>
-<title>Trieu Obfuscator</title>
-
-<style>
-
-body{
-background:#0e0e0e;
-color:white;
-font-family:sans-serif;
-text-align:center
-}
-
-textarea{
-width:80%;
-height:300px;
-background:#111;
-color:#0f0;
-border:1px solid #333;
-padding:10px
-}
-
-button{
-padding:10px 20px;
-background:#00ff88;
-border:none;
-cursor:pointer;
-margin:10px
-}
-
-a{
-color:#00ff88
-}
-
-</style>
-
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trieu Obfuscator</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background: #0a0a0a;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
+    .container {
+      max-width: 900px;
+      width: 100%;
+      background: #151515;
+      border-radius: 20px;
+      padding: 30px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.8);
+      border: 1px solid #2a2a2a;
+    }
+    h2 {
+      text-align: center;
+      font-weight: 400;
+      letter-spacing: 2px;
+      color: #00ff88;
+      margin-bottom: 25px;
+      font-size: 2rem;
+      text-shadow: 0 0 10px rgba(0, 255, 136, 0.3);
+    }
+    .input-area {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+    textarea {
+      width: 100%;
+      height: 280px;
+      background: #1a1a1a;
+      color: #00ff88;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 15px;
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 14px;
+      resize: vertical;
+      transition: border 0.2s;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #00ff88;
+      box-shadow: 0 0 20px rgba(0, 255, 136, 0.1);
+    }
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      flex-wrap: wrap;
+    }
+    .file-label {
+      background: #2a2a2a;
+      padding: 10px 18px;
+      border-radius: 10px;
+      cursor: pointer;
+      border: 1px dashed #555;
+      transition: 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .file-label:hover {
+      border-color: #00ff88;
+      background: #222;
+    }
+    .file-label input[type="file"] {
+      display: none;
+    }
+    .file-label span {
+      font-size: 14px;
+      color: #aaa;
+    }
+    .file-label .filename {
+      color: #00ff88;
+      font-weight: 600;
+      max-width: 150px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin: 10px 0 20px;
+    }
+    button {
+      padding: 12px 30px;
+      background: #00ff88;
+      border: none;
+      border-radius: 50px;
+      font-weight: 600;
+      font-size: 1rem;
+      color: #0a0a0a;
+      cursor: pointer;
+      transition: 0.2s;
+      box-shadow: 0 4px 15px rgba(0, 255, 136, 0.2);
+      min-width: 120px;
+    }
+    button:hover {
+      transform: scale(1.03);
+      background: #66ffbb;
+      box-shadow: 0 6px 25px rgba(0, 255, 136, 0.4);
+    }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    button.secondary {
+      background: #333;
+      color: #eee;
+      box-shadow: none;
+    }
+    button.secondary:hover {
+      background: #444;
+      transform: scale(1.02);
+    }
+    #status {
+      text-align: center;
+      font-size: 0.95rem;
+      min-height: 28px;
+      margin: 5px 0 15px;
+      color: #aaa;
+    }
+    #status.success {
+      color: #00ff88;
+    }
+    #status.error {
+      color: #ff6b6b;
+    }
+    .result-area {
+      margin-top: 20px;
+      border-top: 1px solid #2a2a2a;
+      padding-top: 20px;
+      display: none;
+    }
+    .result-area.show {
+      display: block;
+    }
+    .result-area .label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .result-area .label span {
+      font-size: 0.9rem;
+      color: #888;
+    }
+    .result-area textarea {
+      height: 200px;
+    }
+    .links {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 15px;
+      font-size: 0.95rem;
+    }
+    .links a {
+      color: #00ff88;
+      text-decoration: none;
+      padding: 6px 14px;
+      background: #1a1a1a;
+      border-radius: 30px;
+      border: 1px solid #2a2a2a;
+      transition: 0.2s;
+    }
+    .links a:hover {
+      background: #222;
+      border-color: #00ff88;
+    }
+    .copy-btn {
+      background: #333;
+      color: #eee;
+      padding: 6px 16px;
+      border-radius: 30px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.8rem;
+      transition: 0.2s;
+    }
+    .copy-btn:hover {
+      background: #444;
+    }
+    .copy-btn.copied {
+      background: #00ff88;
+      color: #0a0a0a;
+    }
+    @media (max-width: 600px) {
+      .container {
+        padding: 15px;
+      }
+      h2 {
+        font-size: 1.6rem;
+      }
+      textarea {
+        height: 200px;
+      }
+    }
+  </style>
 </head>
-
 <body>
+  <div class="container">
+    <h2>⚡ Trieu Lua Obfuscator</h2>
 
-<h2>Trieu Lua Obfuscator</h2>
+    <div class="input-area">
+      <textarea id="code" placeholder="Paste your Lua code here..."></textarea>
+      <div class="file-row">
+        <label class="file-label" for="fileInput">
+          <span>📂 Choose file</span>
+          <span class="filename" id="fileName">No file selected</span>
+          <input type="file" id="fileInput" accept=".lua,.txt">
+        </label>
+        <span style="font-size:0.8rem;color:#666;">or paste code above</span>
+      </div>
+    </div>
 
-<textarea id="code"></textarea><br>
+    <div class="actions">
+      <button id="obfBtn" onclick="obfuscate()">🔮 Obfuscate</button>
+      <button class="secondary" onclick="clearAll()">🗑️ Clear</button>
+    </div>
 
-<input type="file" id="file">
+    <div id="status"></div>
 
-<br>
+    <div class="result-area" id="resultArea">
+      <div class="label">
+        <span>Obfuscated Code</span>
+        <button class="copy-btn" id="copyBtn" onclick="copyResult()">📋 Copy</button>
+      </div>
+      <textarea id="resultCode" readonly></textarea>
+      <div class="links" id="linksContainer"></div>
+    </div>
+  </div>
 
-<button onclick="obf()">OBF</button>
+  <script>
+    const codeArea = document.getElementById('code');
+    const fileInput = document.getElementById('fileInput');
+    const fileName = document.getElementById('fileName');
+    const statusDiv = document.getElementById('status');
+    const resultArea = document.getElementById('resultArea');
+    const resultCode = document.getElementById('resultCode');
+    const linksContainer = document.getElementById('linksContainer');
+    const obfBtn = document.getElementById('obfBtn');
+    const copyBtn = document.getElementById('copyBtn');
 
-<p id="links"></p>
+    // Update file name display
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        fileName.textContent = fileInput.files[0].name;
+        // Optionally read file content into textarea
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          codeArea.value = e.target.result;
+        };
+        reader.readAsText(fileInput.files[0]);
+      } else {
+        fileName.textContent = 'No file selected';
+      }
+    });
 
-<script>
+    // Clear all
+    function clearAll() {
+      codeArea.value = '';
+      fileInput.value = '';
+      fileName.textContent = 'No file selected';
+      resultArea.classList.remove('show');
+      resultCode.value = '';
+      linksContainer.innerHTML = '';
+      statusDiv.textContent = '';
+      statusDiv.className = '';
+      copyBtn.textContent = '📋 Copy';
+      copyBtn.classList.remove('copied');
+    }
 
-async function obf(){
+    // Copy result
+    function copyResult() {
+      if (!resultCode.value) return;
+      navigator.clipboard.writeText(resultCode.value).then(() => {
+        copyBtn.textContent = '✅ Copied!';
+        copyBtn.classList.add('copied');
+        setTimeout(() => {
+          copyBtn.textContent = '📋 Copy';
+          copyBtn.classList.remove('copied');
+        }, 2000);
+      }).catch(() => {
+        // Fallback
+        resultCode.select();
+        document.execCommand('copy');
+        copyBtn.textContent = '✅ Copied!';
+        setTimeout(() => {
+          copyBtn.textContent = '📋 Copy';
+        }, 2000);
+      });
+    }
 
-let code=document.getElementById("code").value
-let file=document.getElementById("file").files[0]
+    // Main obfuscate function
+    async function obfuscate() {
+      const code = codeArea.value.trim();
+      const file = fileInput.files[0];
 
-let fd=new FormData()
+      if (!code && !file) {
+        setStatus('Please paste code or select a file.', 'error');
+        return;
+      }
 
-if(file) fd.append("file",file)
-else fd.append("code",code)
+      const formData = new FormData();
+      if (file) {
+        formData.append('file', file);
+      } else {
+        formData.append('code', code);
+      }
 
-let r=await fetch("/obf",{method:"POST",body:fd})
+      obfBtn.disabled = true;
+      setStatus('⏳ Obfuscating...', '');
 
-let d=await r.json()
+      try {
+        const response = await fetch('/obf', {
+          method: 'POST',
+          body: formData,
+        });
 
-document.getElementById("code").value=d.code
+        const data = await response.json();
 
-document.getElementById("links").innerHTML=
-`
-download: <a href="${d.download}" target="_blank">${d.download}</a><br>
-view link: <a href="${d.link}" target="_blank">${d.link}</a>
-`
+        if (data.err) {
+          setStatus('❌ Error: ' + data.err, 'error');
+          obfBtn.disabled = false;
+          return;
+        }
 
-}
+        // Success
+        setStatus('✅ Obfuscation successful!', 'success');
+        resultCode.value = data.code;
+        linksContainer.innerHTML = `
+          <a href="${data.download}" target="_blank">⬇️ Download</a>
+          <a href="${data.link}" target="_blank">👁️ View</a>
+        `;
+        resultArea.classList.add('show');
+        copyBtn.textContent = '📋 Copy';
+        copyBtn.classList.remove('copied');
+      } catch (err) {
+        setStatus('❌ Network error: ' + err.message, 'error');
+      } finally {
+        obfBtn.disabled = false;
+      }
+    }
 
-</script>
+    function setStatus(msg, type) {
+      statusDiv.textContent = msg;
+      statusDiv.className = type;
+    }
 
+    // Optional: if paste code, clear file selection
+    codeArea.addEventListener('input', () => {
+      if (codeArea.value.trim()) {
+        fileInput.value = '';
+        fileName.textContent = 'No file selected';
+      }
+    });
+  </script>
 </body>
 </html>
