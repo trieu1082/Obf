@@ -3,12 +3,18 @@ import multer from "multer"
 import fs from "fs"
 import { nanoid } from "nanoid"
 import { execSync } from "child_process"
+
 const app = express()
 const upload = multer()
+
 app.use(express.json({ limit: "5mb" }))
 app.use(express.static("public"))
+
 if (!fs.existsSync("pastes")) fs.mkdirSync("pastes")
-const LUA_SCRIPT = fs.readFileSync("obfuscator.lua", "utf8");
+
+// Đọc file obfuscator.lua
+const LUA_SCRIPT = fs.readFileSync("obfuscator.lua", "utf8")
+
 app.post("/obf", upload.single("file"), (req, res) => {
   let code = req.body.code
   if (req.file) code = req.file.buffer.toString()
@@ -16,8 +22,14 @@ app.post("/obf", upload.single("file"), (req, res) => {
 
   const tmpFile = `/tmp/obf_${nanoid(8)}.lua`
   fs.writeFileSync(tmpFile, LUA_SCRIPT)
-  const obfCode = execSync(`lua ${tmpFile}`, { input: code, encoding: "utf8" })
-  fs.unlinkSync(tmpFile)
+  let obfCode
+  try {
+    obfCode = execSync(`lua ${tmpFile}`, { input: code, encoding: "utf8" })
+  } catch (e) {
+    return res.json({ err: e.stderr ? e.stderr.toString() : e.message })
+  } finally {
+    fs.unlinkSync(tmpFile)
+  }
 
   const id = nanoid(8)
   fs.writeFileSync(`pastes/${id}.lua`, obfCode)
