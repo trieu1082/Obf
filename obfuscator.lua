@@ -421,7 +421,7 @@ local config = require("config")
 local colors = require("colors")
 logger.LogLevel = { Error=0, Warn=1, Log=2, Info=2, Debug=3 }
 logger.logLevel = logger.LogLevel.Log
-logger.debugCallback = function(...) print(colors(config.NameUpper..": "....., "grey")) end
+logger.debugCallback = function(...) print(colors(config.NameUpper .. ": " .. ..., "grey")) end
 function logger:debug(...) if self.logLevel>=self.LogLevel.Debug then self.debugCallback(...) end end
 logger.logCallback = function(...) print(colors(config.NameUpper..": ", "magenta").....) end
 function logger:log(...) if self.logLevel>=self.LogLevel.Log then self.logCallback(...) end end
