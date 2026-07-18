@@ -1344,4 +1344,4 @@ end
 _MODULES["prometheus"] = function() return prometheus end
 end
 
-return require("prometheus")
+local prometheus = require("prometheus")
