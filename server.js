@@ -14,21 +14,29 @@ if (!fs.existsSync("pastes")) fs.mkdirSync("pastes")
 
 // Đọc file obfuscator.lua
 const LUA_SCRIPT = fs.readFileSync("obfuscator.lua", "utf8")
+console.log("✅ Loaded obfuscator.lua, length:", LUA_SCRIPT.length)
 
 app.post("/obf", upload.single("file"), (req, res) => {
   let code = req.body.code
   if (req.file) code = req.file.buffer.toString()
-  if (!code) return res.json({ err: "no code" })
+  if (!code) return res.status(400).json({ err: "no code" })
 
   const tmpFile = `/tmp/obf_${nanoid(8)}.lua`
   fs.writeFileSync(tmpFile, LUA_SCRIPT)
   let obfCode
   try {
-    obfCode = execSync(`lua ${tmpFile}`, { input: code, encoding: "utf8" })
+    // Dùng lua5.4 thay vì lua (vì Docker cài lua5.4)
+    obfCode = execSync(`lua5.4 ${tmpFile}`, {
+      input: code,
+      encoding: "utf8",
+      timeout: 10000, // 10 giây timeout
+    })
   } catch (e) {
-    return res.json({ err: e.stderr ? e.stderr.toString() : e.message })
+    console.error("❌ Lua error:", e.message)
+    const stderr = e.stderr ? e.stderr.toString() : e.message
+    return res.status(500).json({ err: stderr })
   } finally {
-    fs.unlinkSync(tmpFile)
+    try { fs.unlinkSync(tmpFile) } catch (_) {}
   }
 
   const id = nanoid(8)
@@ -56,4 +64,4 @@ app.get("/view/:id", (req, res) => {
 })
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log("server running"))
+app.listen(PORT, () => console.log("🚀 Server running on port", PORT))
