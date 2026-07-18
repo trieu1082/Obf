@@ -1,6 +1,9 @@
 FROM node:18-slim
 
-RUN apt-get update && apt-get install -y lua5.4 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y lua5.4 && \
+    ln -s /usr/bin/lua5.4 /usr/bin/lua && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
