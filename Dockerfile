@@ -1,8 +1,9 @@
 FROM node:18-slim
 
-RUN apt-get update && \
+RUN apt-get update -y && \
     apt-get install -y luajit && \
     ln -s /usr/bin/luajit /usr/bin/lua && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
