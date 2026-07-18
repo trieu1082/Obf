@@ -13,6 +13,9 @@ RUN npm install
 
 COPY . .
 
+# Kiểm tra symlink
+RUN ls -la /usr/bin/lua
+
 EXPOSE 3000
 
 CMD ["node", "server.js"]
