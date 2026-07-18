@@ -1,4 +1,3 @@
---[[ Combined Prometheus Obfuscator by trieu1082 --]]
 local _MODULES = {}
 local function require_impl(name)
   local mod = _MODULES[name]
@@ -13,7 +12,6 @@ local function require_impl(name)
 end
 require = require_impl
 
--- enums
 do
 local Enums = {}
 Enums.LuaVersion = { LuaU = "LuaU", Lua51 = "Lua51" }
@@ -60,7 +58,6 @@ Enums.Conventions = {
 _MODULES["prometheus.enums"] = function() return Enums end
 end
 
--- util
 do
 local util = {}
 function util.lookupify(tb) local res={} for _,v in ipairs(tb) do res[v]=true end return res end
@@ -75,7 +72,6 @@ util.utf8char = utf8char
 _MODULES["prometheus.util"] = function() return util end
 end
 
--- config
 do
 local config = {
     IdentPrefix = "____",
@@ -84,7 +80,6 @@ local config = {
 _MODULES["config"] = function() return config end
 end
 
--- logger
 do
 local logger = {}
 function logger.info(msg) if require("config").Debug then print("[INFO] " .. msg) end end
@@ -93,7 +88,6 @@ function logger.error(msg) error("[ERROR] " .. msg, 2) end
 _MODULES["logger"] = function() return logger end
 end
 
--- ast
 do
 local Ast = {}
 local AstKind = {
@@ -199,7 +193,6 @@ function Ast.FunctionLiteralExpression(a,b) return {kind=AstKind.FunctionLiteral
 _MODULES["prometheus.ast"] = function() return Ast end
 end
 
--- scope
 do
 local Scope = {}
 local config = require("config")
@@ -234,7 +227,6 @@ function Scope:renameVariables(settings) if not self.isGlobal then local prefix=
 _MODULES["prometheus.scope"] = function() return Scope end
 end
 
--- tokenizer
 do
 local Tokenizer = {}
 local Enums = require("prometheus.enums")
@@ -280,7 +272,6 @@ function Tokenizer:scanAll() local tb={} repeat local tok=self:next() table.inse
 _MODULES["prometheus.tokenizer"] = function() return Tokenizer end
 end
 
--- parser
 do
 local Parser = {}
 local Ast = require("prometheus.ast")
@@ -892,7 +883,6 @@ end
 _MODULES["prometheus.parser"] = function() return Parser end
 end
 
--- generator
 do
 local Generator = {}
 local Ast = require("prometheus.ast")
@@ -1248,7 +1238,6 @@ end
 _MODULES["prometheus.generator"] = function() return Generator end
 end
 
--- passes
 do
 local passes = {}
 local Ast = require("prometheus.ast")
@@ -1260,51 +1249,6 @@ function passes.RenameVariables(ast, settings)
 end
 
 function passes.EncryptStrings(ast)
-    local key = math.random(1, 255)
-    local function encrypt(str)
-        local bytes = {string.byte(str, 1, #str)}
-        for i, b in ipairs(bytes) do
-            bytes[i] = string.char(b ~ key)
-        end
-        return table.concat(bytes)
-    end
-
-    local function visit(node, parent, index)
-        if node.kind == AstKind.StringExpression then
-            local encrypted = encrypt(node.value)
-            local decodeFunc = Ast.FunctionLiteralExpression(
-                {"s"},
-                Ast.Block({
-                    Ast.LocalVariableDeclaration(nil, {1}, {Ast.NumberExpression(key)}),
-                    Ast.ReturnStatement({
-                        Ast.FunctionCallExpression(
-                            Ast.IndexExpression(Ast.VariableExpression(nil, nil) -- placeholder, sẽ sửa sau
-                            , nil)
-                        , {Ast.StringExpression(encrypted)})
-                    })
-                }, nil)
-            )
-            -- Thay thế bằng một hàm gọi decode tại chỗ
-            local newCall = Ast.FunctionCallExpression(
-                decodeFunc,
-                {Ast.StringExpression(encrypted)}
-            )
-            if parent then
-                if type(index) == "number" then
-                    parent[index] = newCall
-                elseif index then
-                    parent[index] = newCall
-                end
-            end
-        end
-        if node.kind == AstKind.Block then
-            for i, stmt in ipairs(node.statements) do
-                visit(stmt, node.statements, i)
-            end
-        end
-    end
-
-    visit(ast.body, nil, nil)
 end
 
 function passes.ShuffleStatements(ast)
@@ -1351,7 +1295,6 @@ end
 _MODULES["prometheus.passes"] = function() return passes end
 end
 
--- main prometheus module
 do
 local prometheus = {}
 
