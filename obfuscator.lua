@@ -430,7 +430,6 @@ function logger:warn(...) if self.logLevel>=self.LogLevel.Warn then self.warnCal
 logger.errorCallback = function(...) print(colors(config.NameUpper .. ": " .. ..., "red")) error(...) end
 function logger:error(...) self.errorCallback(...) error(config.NameUpper..": logger.errorCallback did not throw an Error!") end
 _MODULES["logger"] = function() return logger end
-end
 -- colors
 do
 local colors = {}
