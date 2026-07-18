@@ -75,6 +75,24 @@ util.utf8char = utf8char
 _MODULES["prometheus.util"] = function() return util end
 end
 
+-- config
+do
+local config = {
+    IdentPrefix = "____",
+    Debug = false,
+}
+_MODULES["config"] = function() return config end
+end
+
+-- logger
+do
+local logger = {}
+function logger.info(msg) if require("config").Debug then print("[INFO] " .. msg) end end
+function logger.warn(msg) print("[WARN] " .. msg) end
+function logger.error(msg) error("[ERROR] " .. msg, 2) end
+_MODULES["logger"] = function() return logger end
+end
+
 -- ast
 do
 local Ast = {}
@@ -265,584 +283,1122 @@ end
 -- parser
 do
 local Parser = {}
-local Tokenizer = require("prometheus.tokenizer")
-local Enums = require("prometheus.enums")
-local util = require("prometheus.util")
 local Ast = require("prometheus.ast")
-local Scope = require("prometheus.scope")
-local logger = require("logger")
 local AstKind = Ast.AstKind
-local LuaVersion = Enums.LuaVersion
-local lookupify = util.lookupify
-local TokenKind = Tokenizer.TokenKind
-local ASSIGNMENT_NO_WARN_LOOKUP = lookupify{AstKind.NilExpression,AstKind.FunctionCallExpression,AstKind.PassSelfFunctionCallExpression,AstKind.VarargExpression}
-local CALLABLE_PREFIX_EXPRESSION_LOOKUP = lookupify{AstKind.VariableExpression,AstKind.IndexExpression,AstKind.FunctionCallExpression,AstKind.PassSelfFunctionCallExpression}
-local function generateError(self,msg) local tok if self.index>self.length then tok=self.tokens[self.length] elseif self.index<1 then return "Parsing Error at Position 0:0, "..msg else tok=self.tokens[self.index] end return "Parsing Error at Position "..tok.line..":"..tok.linePos..", "..msg end
-local function generateWarning(token,msg) return "Warning at Position "..token.line..":"..token.linePos..", "..msg end
-function Parser:new(settings) local lv=(settings and (settings.luaVersion or settings.LuaVersion)) or LuaVersion.LuaU local p={luaVersion=lv,tokenizer=Tokenizer:new({luaVersion=lv}),tokens={},length=0,index=0} setmetatable(p,self) self.__index=self return p end
-local function peek(self,n) n=n or 0 local i=self.index+n+1 if i>self.length then return Tokenizer.EOF_TOKEN end return self.tokens[i] end
-local function get(self) local i=self.index+1 if i>self.length then error(generateError(self,"Unexpected end of Input")) end self.index=self.index+1 return self.tokens[i] end
-local function is(self,kind,sourceOrN,n) local tok=peek(self,n) local src=nil if type(sourceOrN)=="string" then src=sourceOrN else n=sourceOrN end n=n or 0 if tok.kind==kind then if src==nil or tok.source==src then return true end end return false end
-local function consume(self,kind,source) if is(self,kind,source) then self.index=self.index+1 return true end return false end
-local function expect(self,kind,source) if is(self,kind,source,0) then return get(self) end local tok=peek(self) if self.disableLog then error() end if source then logger:error(generateError(self,"unexpected token <"..tok.kind.."> \""..tok.source.."\", expected <"..kind.."> \""..source.."\"")) else logger:error(generateError(self,"unexpected token <"..tok.kind.."> \""..tok.source.."\", expected <"..kind..">")) end end
-function Parser:parse(code) self.tokenizer:append(code) self.tokens=self.tokenizer:scanAll() self.length=#self.tokens local globalScope=Scope:newGlobal() local ast=Ast.TopNode(self:block(globalScope,false),globalScope) expect(self,TokenKind.Eof) self.tokenizer:reset() self.tokens={} self.index=0 self.length=0 return ast end
-function Parser:block(parentScope,currentLoop,scope) scope=scope or Scope:new(parentScope) local stmts={} repeat local st,isTerm=self:statement(scope,currentLoop) table.insert(stmts,st) until isTerm or not st consume(self,TokenKind.Symbol,";") return Ast.Block(stmts,scope) end
-function Parser:statement(scope,currentLoop) while consume(self,TokenKind.Symbol,";") do end if consume(self,TokenKind.Keyword,"break") then if not currentLoop then if self.disableLog then error() end logger:error(generateError(self,"the break Statement is only valid inside of loops")) end return Ast.BreakStatement(currentLoop,scope), true end if self.luaVersion==LuaVersion.LuaU and consume(self,TokenKind.Keyword,"continue") then if not currentLoop then if self.disableLog then error() end logger:error(generateError(self,"the continue Statement is only valid inside of loops")) end return Ast.ContinueStatement(currentLoop,scope), true end if consume(self,TokenKind.Keyword,"do") then local body=self:block(scope,currentLoop) expect(self,TokenKind.Keyword,"end") return Ast.DoStatement(body) end if consume(self,TokenKind.Keyword,"while") then local cond=self:expression(scope) expect(self,TokenKind.Keyword,"do") local st=Ast.WhileStatement(nil,cond,scope) st.body=self:block(scope,st) expect(self,TokenKind.Keyword,"end") return st end if consume(self,TokenKind.Keyword,"repeat") then local repScope=Scope:new(scope) local st=Ast.RepeatStatement(nil,nil,scope) st.body=self:block(nil,st,repScope) expect(self,TokenKind.Keyword,"until") st.condition=self:expression(repScope) return st end if consume(self,TokenKind.Keyword,"return") then local args={} if not is(self,TokenKind.Keyword,"end") and not is(self,TokenKind.Keyword,"elseif") and not is(self,TokenKind.Keyword,"else") and not is(self,TokenKind.Symbol,";") and not is(self,TokenKind.Eof) then args=self:exprList(scope) end return Ast.ReturnStatement(args), true end if consume(self,TokenKind.Keyword,"if") then local cond=self:expression(scope) expect(self,TokenKind.Keyword,"then") local body=self:block(scope,currentLoop) local elseifs={} while consume(self,TokenKind.Keyword,"elseif") do local econd=self:expression(scope) expect(self,TokenKind.Keyword,"then") local ebody=self:block(scope,currentLoop) table.insert(elseifs,{condition=econd,body=ebody}) end local elsebody=nil if consume(self,TokenKind.Keyword,"else") then elsebody=self:block(scope,currentLoop) end expect(self,TokenKind.Keyword,"end") return Ast.IfStatement(cond,body,elseifs,elsebody) end if consume(self,TokenKind.Keyword,"function") then local obj=self:funcName(scope) local baseScope=obj.scope local baseId=obj.id local indices=obj.indices local funcScope=Scope:new(scope) expect(self,TokenKind.Symbol,"(") local args=self:functionArgList(funcScope) expect(self,TokenKind.Symbol,")") if obj.passSelf then local id=funcScope:addVariable("self",obj.token) table.insert(args,1,Ast.VariableExpression(funcScope,id)) end local body=self:block(nil,false,funcScope) expect(self,TokenKind.Keyword,"end") return Ast.FunctionDeclaration(baseScope,baseId,indices,args,body) end if consume(self,TokenKind.Keyword,"local") then if consume(self,TokenKind.Keyword,"function") then local idt=expect(self,TokenKind.Ident) local name=idt.value local id=scope:addVariable(name,idt) local funcScope=Scope:new(scope) expect(self,TokenKind.Symbol,"(") local args=self:functionArgList(funcScope) expect(self,TokenKind.Symbol,")") local body=self:block(nil,false,funcScope) expect(self,TokenKind.Keyword,"end") return Ast.LocalFunctionDeclaration(scope,id,args,body) end local ids=self:nameList(scope) local exprs={} if consume(self,TokenKind.Symbol,"=") then exprs=self:exprList(scope) end self:enableNameList(scope,ids) if #exprs>#ids then logger:warn(generateWarning(peek(self,-1),string.format("assigning %d values to %d variable%s",#exprs,#ids,(#ids>1 and "s") or ""))) elseif #ids>#exprs and #exprs>0 and not ASSIGNMENT_NO_WARN_LOOKUP[exprs[#exprs].kind] then logger:warn(generateWarning(peek(self,-1),string.format("assigning %d value%s to %d variables initializes extra variables with nil",#exprs,(#exprs>1 and "s") or "",#ids))) end return Ast.LocalVariableDeclaration(scope,ids,exprs) end if consume(self,TokenKind.Keyword,"for") then if is(self,TokenKind.Symbol,"=",1) then local forScope=Scope:new(scope) local idt=expect(self,TokenKind.Ident) local vid=forScope:addDisabledVariable(idt.value,idt) expect(self,TokenKind.Symbol,"=") local init=self:expression(scope) expect(self,TokenKind.Symbol,",") local fin=self:expression(scope) local inc=Ast.NumberExpression(1) if consume(self,TokenKind.Symbol,",") then inc=self:expression(scope) end local st=Ast.ForStatement(forScope,vid,init,fin,inc,nil,scope) forScope:enableVariable(vid) expect(self,TokenKind.Keyword,"do") st.body=self:block(nil,st,forScope) expect(self,TokenKind.Keyword,"end") return st end local forScope=Scope:new(scope) local ids=self:nameList(forScope) expect(self,TokenKind.Keyword,"in") local exprs=self:exprList(scope) self:enableNameList(forScope,ids) expect(self,TokenKind.Keyword,"do") local st=Ast.ForInStatement(forScope,ids,exprs,nil,scope) st.body=self:block(nil,st,forScope) expect(self,TokenKind.Keyword,"end") return st end local expr=self:primaryExpression(scope) if expr then if expr.kind==AstKind.FunctionCallExpression then return Ast.FunctionCallStatement(expr.base,expr.args) end if expr.kind==AstKind.PassSelfFunctionCallExpression then return Ast.PassSelfFunctionCallStatement(expr.base,expr.passSelfFunctionName,expr.args) end if expr.kind==AstKind.IndexExpression or expr.kind==AstKind.VariableExpression then if expr.kind==AstKind.IndexExpression then expr.kind=AstKind.AssignmentIndexing end if expr.kind==AstKind.VariableExpression then expr.kind=AstKind.AssignmentVariable end if self.luaVersion==LuaVersion.LuaU then if consume(self,TokenKind.Symbol,"+=") then local rhs=self:expression(scope) return Ast.CompoundAddStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"-=") then local rhs=self:expression(scope) return Ast.CompoundSubStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"*=") then local rhs=self:expression(scope) return Ast.CompoundMulStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"/=") then local rhs=self:expression(scope) return Ast.CompoundDivStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"%=") then local rhs=self:expression(scope) return Ast.CompoundModStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"^=") then local rhs=self:expression(scope) return Ast.CompoundPowStatement(expr,rhs) end if consume(self,TokenKind.Symbol,"..=") then local rhs=self:expression(scope) return Ast.CompoundConcatStatement(expr,rhs) end end local lhs={expr} while consume(self,TokenKind.Symbol,",") do expr=self:primaryExpression(scope) if not expr then if self.disableLog then error() end logger:error(generateError(self,"expected a valid assignment statement lhs part")) end if expr.kind==AstKind.IndexExpression or expr.kind==AstKind.VariableExpression then if expr.kind==AstKind.IndexExpression then expr.kind=AstKind.AssignmentIndexing end if expr.kind==AstKind.VariableExpression then expr.kind=AstKind.AssignmentVariable end table.insert(lhs,expr) else if self.disableLog then error() end logger:error(generateError(self,"expected a valid assignment statement lhs part but got <"..expr.kind..">")) end end expect(self,TokenKind.Symbol,"=") local rhs=self:exprList(scope) return Ast.AssignmentStatement(lhs,rhs) end if self.disableLog then error() end logger:error(generateError(self,"expressions are not valid statements!")) end return nil end
-function Parser:primaryExpression(scope) local i=self.index local s=self self.disableLog=true local ok,val=pcall(self.expressionFunctionCall,self,scope) self.disableLog=false if ok then return val else self.index=i return nil end end
-function Parser:exprList(scope) local exprs={self:expression(scope)} while consume(self,TokenKind.Symbol,",") do table.insert(exprs,self:expression(scope)) end return exprs end
-function Parser:nameList(scope) local ids={} local idt=expect(self,TokenKind.Ident) table.insert(ids,scope:addDisabledVariable(idt.value,idt)) while consume(self,TokenKind.Symbol,",") do idt=expect(self,TokenKind.Ident) table.insert(ids,scope:addDisabledVariable(idt.value,idt)) end return ids end
-function Parser:enableNameList(scope,list) for _,id in ipairs(list) do scope:enableVariable(id) end end
-function Parser:funcName(scope) local idt=expect(self,TokenKind.Ident) local baseName=idt.value local baseScope,baseId=scope:resolve(baseName) local indices={} local passSelf=false while consume(self,TokenKind.Symbol,".") do table.insert(indices,expect(self,TokenKind.Ident).value) end if consume(self,TokenKind.Symbol,":") then table.insert(indices,expect(self,TokenKind.Ident).value) passSelf=true end return {scope=baseScope,id=baseId,indices=indices,passSelf=passSelf,token=idt} end
-function Parser:expression(scope) return self:expressionOr(scope) end
-function Parser:expressionOr(scope) local lhs=self:expressionAnd(scope) if consume(self,TokenKind.Keyword,"or") then local rhs=self:expressionOr(scope) return Ast.OrExpression(lhs,rhs,true) end return lhs end
-function Parser:expressionAnd(scope) local lhs=self:expressionComparision(scope) if consume(self,TokenKind.Keyword,"and") then local rhs=self:expressionAnd(scope) return Ast.AndExpression(lhs,rhs,true) end return lhs end
-function Parser:expressionComparision(scope) local curr=self:expressionStrCat(scope) repeat local found=false if consume(self,TokenKind.Symbol,"<") then local rhs=self:expressionStrCat(scope) curr=Ast.LessThanExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,">") then local rhs=self:expressionStrCat(scope) curr=Ast.GreaterThanExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"<=") then local rhs=self:expressionStrCat(scope) curr=Ast.LessThanOrEqualsExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,">=") then local rhs=self:expressionStrCat(scope) curr=Ast.GreaterThanOrEqualsExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"~=") then local rhs=self:expressionStrCat(scope) curr=Ast.NotEqualsExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"==") then local rhs=self:expressionStrCat(scope) curr=Ast.EqualsExpression(curr,rhs,true) found=true end until not found return curr end
-function Parser:expressionStrCat(scope) local lhs=self:expressionAddSub(scope) if consume(self,TokenKind.Symbol,"..") then local rhs=self:expressionStrCat(scope) return Ast.StrCatExpression(lhs,rhs,true) end return lhs end
-function Parser:expressionAddSub(scope) local curr=self:expressionMulDivMod(scope) repeat local found=false if consume(self,TokenKind.Symbol,"+") then local rhs=self:expressionMulDivMod(scope) curr=Ast.AddExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"-") then local rhs=self:expressionMulDivMod(scope) curr=Ast.SubExpression(curr,rhs,true) found=true end until not found return curr end
-function Parser:expressionMulDivMod(scope) local curr=self:expressionUnary(scope) repeat local found=false if consume(self,TokenKind.Symbol,"*") then local rhs=self:expressionUnary(scope) curr=Ast.MulExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"/") then local rhs=self:expressionUnary(scope) curr=Ast.DivExpression(curr,rhs,true) found=true end if consume(self,TokenKind.Symbol,"%") then local rhs=self:expressionUnary(scope) curr=Ast.ModExpression(curr,rhs,true) found=true end until not found return curr end
-function Parser:expressionUnary(scope) if consume(self,TokenKind.Keyword,"not") then local rhs=self:expressionUnary(scope) return Ast.NotExpression(rhs,true) end if consume(self,TokenKind.Symbol,"#") then local rhs=self:expressionUnary(scope) return Ast.LenExpression(rhs,true) end if consume(self,TokenKind.Symbol,"-") then local rhs=self:expressionUnary(scope) return Ast.NegateExpression(rhs,true) end return self:expressionPow(scope) end
-function Parser:expressionPow(scope) local lhs=self:tableOrFunctionLiteral(scope) if consume(self,TokenKind.Symbol,"^") then local rhs=self:expressionUnary(scope) return Ast.PowExpression(lhs,rhs,true) end return lhs end
-function Parser:tableOrFunctionLiteral(scope) if is(self,TokenKind.Symbol,"{") then return self:tableConstructor(scope) end if is(self,TokenKind.Keyword,"function") then return self:expressionFunctionLiteral(scope) end return self:expressionFunctionCall(scope) end
-function Parser:expressionFunctionLiteral(parentScope) local scope=Scope:new(parentScope) expect(self,TokenKind.Keyword,"function") expect(self,TokenKind.Symbol,"(") local args=self:functionArgList(scope) expect(self,TokenKind.Symbol,")") local body=self:block(nil,false,scope) expect(self,TokenKind.Keyword,"end") return Ast.FunctionLiteralExpression(args,body) end
-function Parser:functionArgList(scope) local args={} if consume(self,TokenKind.Symbol,"...") then table.insert(args,Ast.VarargExpression()) return args end if is(self,TokenKind.Ident) then local idt=get(self) local name=idt.value table.insert(args,Ast.VariableExpression(scope,scope:addVariable(name,idt))) while consume(self,TokenKind.Symbol,",") do if consume(self,TokenKind.Symbol,"...") then table.insert(args,Ast.VarargExpression()) return args end idt=get(self) name=idt.value table.insert(args,Ast.VariableExpression(scope,scope:addVariable(name,idt))) end end return args end
-function Parser:expressionFunctionCall(scope,base) base=base or self:expressionIndex(scope) if not (base and (CALLABLE_PREFIX_EXPRESSION_LOOKUP[base.kind] or base.isParenthesizedExpression)) then return base end local args={} if is(self,TokenKind.String) then args={Ast.StringExpression(get(self).value)} elseif is(self,TokenKind.Symbol,"{") then args={self:tableConstructor(scope)} elseif consume(self,TokenKind.Symbol,"(") then if not is(self,TokenKind.Symbol,")") then args=self:exprList(scope) end expect(self,TokenKind.Symbol,")") else return base end local node=Ast.FunctionCallExpression(base,args) if is(self,TokenKind.Symbol,".") or is(self,TokenKind.Symbol,"[") or is(self,TokenKind.Symbol,":") then return self:expressionIndex(scope,node) end if is(self,TokenKind.Symbol,"(") or is(self,TokenKind.Symbol,"{") or is(self,TokenKind.String) then return self:expressionFunctionCall(scope,node) end return node end
-function Parser:expressionIndex(scope,base) base=base or self:expressionLiteral(scope) while consume(self,TokenKind.Symbol,"[") do local e=self:expression(scope) expect(self,TokenKind.Symbol,"]") base=Ast.IndexExpression(base,e) end while consume(self,TokenKind.Symbol,".") do local idt=expect(self,TokenKind.Ident) base=Ast.IndexExpression(base,Ast.StringExpression(idt.value)) while consume(self,TokenKind.Symbol,"[") do local e=self:expression(scope) expect(self,TokenKind.Symbol,"]") base=Ast.IndexExpression(base,e) end end if consume(self,TokenKind.Symbol,":") then local name=expect(self,TokenKind.Ident).value local args={} if is(self,TokenKind.String) then args={Ast.StringExpression(get(self).value)} elseif is(self,TokenKind.Symbol,"{") then args={self:tableConstructor(scope)} else expect(self,TokenKind.Symbol,"(") if not is(self,TokenKind.Symbol,")") then args=self:exprList(scope) end expect(self,TokenKind.Symbol,")") end local node=Ast.PassSelfFunctionCallExpression(base,name,args) if is(self,TokenKind.Symbol,".") or is(self,TokenKind.Symbol,"[") or is(self,TokenKind.Symbol,":") then return self:expressionIndex(scope,node) end if is(self,TokenKind.Symbol,"(") or is(self,TokenKind.Symbol,"{") or is(self,TokenKind.String) then return self:expressionFunctionCall(scope,node) end return node end if is(self,TokenKind.Symbol,"(") or is(self,TokenKind.Symbol,"{") or is(self,TokenKind.String) then return self:expressionFunctionCall(scope,base) end return base end
-function Parser:expressionLiteral(scope) if consume(self,TokenKind.Symbol,"(") then local e=self:expression(scope) expect(self,TokenKind.Symbol,")") if e then e.isParenthesizedExpression=true end return e end if is(self,TokenKind.String) then return Ast.StringExpression(get(self).value) end if is(self,TokenKind.Number) then return Ast.NumberExpression(get(self).value) end if consume(self,TokenKind.Keyword,"true") then return Ast.BooleanExpression(true) end if consume(self,TokenKind.Keyword,"false") then return Ast.BooleanExpression(false) end if consume(self,TokenKind.Keyword,"nil") then return Ast.NilExpression() end if consume(self,TokenKind.Symbol,"...") then return Ast.VarargExpression() end if is(self,TokenKind.Ident) then local idt=get(self) local name=idt.value local sc,id=scope:resolve(name) return Ast.VariableExpression(sc,id) end if LuaVersion.LuaU then if consume(self,TokenKind.Keyword,"if") then local cond=self:expression(scope) expect(self,TokenKind.Keyword,"then") local tv=self:expression(scope) local elseifs={} while consume(self,TokenKind.Keyword,"elseif") do local ec=self:expression(scope) expect(self,TokenKind.Keyword,"then") local ev=self:expression(scope) table.insert(elseifs,{condition=ec,value=ev}) end expect(self,TokenKind.Keyword,"else") local fv=self:expression(scope) return Ast.IfElseExpression(cond,tv,elseifs,fv) end end if self.disableLog then error() end logger:error(generateError(self,"Unexpected Token \""..peek(self).source.."\". Expected a Expression!")) end
-function Parser:tableConstructor(scope) local entries={} expect(self,TokenKind.Symbol,"{") while not consume(self,TokenKind.Symbol,"}") do if consume(self,TokenKind.Symbol,"[") then local key=self:expression(scope) expect(self,TokenKind.Symbol,"]") expect(self,TokenKind.Symbol,"=") local val=self:expression(scope) table.insert(entries,Ast.KeyedTableEntry(key,val)) elseif is(self,TokenKind.Ident,0) and is(self,TokenKind.Symbol,"=",1) then local key=Ast.StringExpression(get(self).value) expect(self,TokenKind.Symbol,"=") local val=self:expression(scope) table.insert(entries,Ast.KeyedTableEntry(key,val)) else local val=self:expression(scope) table.insert(entries,Ast.TableEntry(val)) end if not consume(self,TokenKind.Symbol,";") and not consume(self,TokenKind.Symbol,",") and not is(self,TokenKind.Symbol,"}") then if self.disableLog then error() end logger:error(generateError(self,"expected a \";\" or a \",\"")) end end return Ast.TableConstructorExpression(entries) end
+local Scope = require("prometheus.scope")
+local Tokenizer = require("prometheus.tokenizer")
+local config = require("config")
+local logger = require("logger")
+
+function Parser:new(tokenizer, settings)
+    local p = {
+        tokenizer = tokenizer,
+        settings = settings or {},
+        globalScope = Scope:newGlobal(),
+        currentScope = nil,
+        currentLoop = nil,
+        current = nil,
+        nextTok = nil,
+    }
+    p.currentScope = p.globalScope
+    p.current = tokenizer:next()
+    p.nextTok = tokenizer:next()
+    setmetatable(p, {__index = Parser})
+    return p
+end
+
+function Parser:advance()
+    self.current = self.nextTok
+    self.nextTok = self.tokenizer:next()
+end
+
+function Parser:peek()
+    return self.nextTok
+end
+
+function Parser:expect(kind, value)
+    if self.current.kind == kind and (value == nil or self.current.value == value) then
+        local tok = self.current
+        self:advance()
+        return tok
+    end
+    logger:error(string.format("Expected %s %s, got %s %s at line %d:%d",
+        kind, value or "", self.current.kind, self.current.value or "", self.current.line, self.current.linePos))
+end
+
+function Parser:parse()
+    local body = self:parseBlock({ ["Eof"] = true })
+    return Ast.TopNode(body, self.globalScope)
+end
+
+function Parser:parseBlock(stopTokens)
+    local statements = {}
+    while true do
+        local tok = self.current
+        if stopTokens[tok.kind] or (tok.kind == "Keyword" and stopTokens[tok.value]) then
+            break
+        end
+        local stmt = self:parseStatement()
+        if stmt then
+            table.insert(statements, stmt)
+        end
+    end
+    return Ast.Block(statements, self.currentScope)
+end
+
+function Parser:parseStatement()
+    local tok = self.current
+    if tok.kind == "Keyword" then
+        local kw = tok.value
+        if kw == "if" then return self:parseIfStatement()
+        elseif kw == "while" then return self:parseWhileStatement()
+        elseif kw == "repeat" then return self:parseRepeatStatement()
+        elseif kw == "for" then return self:parseForStatement()
+        elseif kw == "function" then return self:parseFunctionDeclaration()
+        elseif kw == "local" then return self:parseLocalDeclaration()
+        elseif kw == "return" then return self:parseReturnStatement()
+        elseif kw == "break" then self:advance(); return Ast.BreakStatement(self.currentLoop, self.currentScope)
+        elseif kw == "continue" then self:advance(); return Ast.ContinueStatement(self.currentLoop, self.currentScope)
+        elseif kw == "do" then return self:parseDoStatement()
+        else logger:error("Unexpected keyword " .. kw)
+        end
+    elseif tok.kind == "Symbol" and tok.value == "::" then
+        return self:parseLabel()
+    elseif tok.kind == "Symbol" and tok.value == ";" then
+        self:advance()
+        return nil
+    else
+        return self:parseAssignmentOrCallStatement()
+    end
+end
+
+function Parser:parseIfStatement()
+    self:expect("Keyword", "if")
+    local condition = self:parseExpression()
+    self:expect("Keyword", "then")
+    local body = self:parseBlock({ ["end"] = true, ["else"] = true, ["elseif"] = true })
+    local elseifs = {}
+    while self.current.kind == "Keyword" and self.current.value == "elseif" do
+        self:advance()
+        local elseifCond = self:parseExpression()
+        self:expect("Keyword", "then")
+        local elseifBody = self:parseBlock({ ["end"] = true, ["else"] = true, ["elseif"] = true })
+        table.insert(elseifs, { condition = elseifCond, body = elseifBody })
+    end
+    local elseBody = nil
+    if self.current.kind == "Keyword" and self.current.value == "else" then
+        self:advance()
+        elseBody = self:parseBlock({ ["end"] = true })
+    end
+    self:expect("Keyword", "end")
+    return Ast.IfStatement(condition, body, elseifs, elseBody)
+end
+
+function Parser:parseWhileStatement()
+    self:expect("Keyword", "while")
+    local condition = self:parseExpression()
+    self:expect("Keyword", "do")
+    local oldLoop = self.currentLoop
+    self.currentLoop = "while"
+    local body = self:parseBlock({ ["end"] = true })
+    self:expect("Keyword", "end")
+    self.currentLoop = oldLoop
+    return Ast.WhileStatement(body, condition, self.currentScope)
+end
+
+function Parser:parseRepeatStatement()
+    self:expect("Keyword", "repeat")
+    local oldLoop = self.currentLoop
+    self.currentLoop = "repeat"
+    local body = self:parseBlock({ ["until"] = true })
+    self:expect("Keyword", "until")
+    local condition = self:parseExpression()
+    self.currentLoop = oldLoop
+    return Ast.RepeatStatement(condition, body, self.currentScope)
+end
+
+function Parser:parseForStatement()
+    self:expect("Keyword", "for")
+    local firstName = self:expect("Ident").value
+    if self.current.kind == "Symbol" and self.current.value == "=" then
+        self:advance()
+        local init = self:parseExpression()
+        self:expect("Symbol", ",")
+        local limit = self:parseExpression()
+        local step = nil
+        if self.current.kind == "Symbol" and self.current.value == "," then
+            self:advance()
+            step = self:parseExpression()
+        end
+        self:expect("Keyword", "do")
+        local newScope = Scope:new(self.currentScope)
+        local id = newScope:addVariable(firstName)
+        self.currentScope = newScope
+        local oldLoop = self.currentLoop
+        self.currentLoop = "for"
+        local body = self:parseBlock({ ["end"] = true })
+        self:expect("Keyword", "end")
+        self.currentScope = newScope:getParent()
+        self.currentLoop = oldLoop
+        return Ast.ForStatement(newScope, id, init, limit, step or Ast.NumberExpression(1), body, self.currentScope)
+    else
+        local names = { firstName }
+        while self.current.kind == "Symbol" and self.current.value == "," do
+            self:advance()
+            table.insert(names, self:expect("Ident").value)
+        end
+        self:expect("Keyword", "in")
+        local exprs = { self:parseExpression() }
+        while self.current.kind == "Symbol" and self.current.value == "," do
+            self:advance()
+            table.insert(exprs, self:parseExpression())
+        end
+        self:expect("Keyword", "do")
+        local newScope = Scope:new(self.currentScope)
+        local ids = {}
+        for _, n in ipairs(names) do
+            table.insert(ids, newScope:addVariable(n))
+        end
+        self.currentScope = newScope
+        local oldLoop = self.currentLoop
+        self.currentLoop = "forin"
+        local body = self:parseBlock({ ["end"] = true })
+        self:expect("Keyword", "end")
+        self.currentScope = newScope:getParent()
+        self.currentLoop = oldLoop
+        return Ast.ForInStatement(newScope, ids, exprs, body, self.currentScope)
+    end
+end
+
+function Parser:parseFunctionDeclaration()
+    self:expect("Keyword", "function")
+    local baseName = self:expect("Ident").value
+    local scope, baseId = self.currentScope:resolve(baseName)
+    local indices = {}
+    while self.current.kind == "Symbol" and self.current.value == "." do
+        self:advance()
+        table.insert(indices, self:expect("Ident").value)
+    end
+    local methodName = nil
+    if self.current.kind == "Symbol" and self.current.value == ":" then
+        self:advance()
+        methodName = self:expect("Ident").value
+    end
+    self:expect("Symbol", "(")
+    local args = self:parseFunctionArgs()
+    self:expect("Symbol", ")")
+    local body, funcScope = self:parseFunctionBody(args)
+    self:expect("Keyword", "end")
+    return Ast.FunctionDeclaration(scope, baseId, indices, args, body)
+end
+
+function Parser:parseLocalDeclaration()
+    self:expect("Keyword", "local")
+    if self.current.kind == "Keyword" and self.current.value == "function" then
+        self:advance()
+        local name = self:expect("Ident").value
+        self:expect("Symbol", "(")
+        local args = self:parseFunctionArgs()
+        self:expect("Symbol", ")")
+        local body, funcScope = self:parseFunctionBody(args)
+        self:expect("Keyword", "end")
+        local id = self.currentScope:addVariable(name)
+        return Ast.LocalFunctionDeclaration(self.currentScope, id, args, body)
+    else
+        local names = { self:expect("Ident").value }
+        while self.current.kind == "Symbol" and self.current.value == "," do
+            self:advance()
+            table.insert(names, self:expect("Ident").value)
+        end
+        local exprs = {}
+        if self.current.kind == "Symbol" and self.current.value == "=" then
+            self:advance()
+            table.insert(exprs, self:parseExpression())
+            while self.current.kind == "Symbol" and self.current.value == "," do
+                self:advance()
+                table.insert(exprs, self:parseExpression())
+            end
+        end
+        local ids = {}
+        for _, n in ipairs(names) do
+            table.insert(ids, self.currentScope:addVariable(n))
+        end
+        return Ast.LocalVariableDeclaration(self.currentScope, ids, exprs)
+    end
+end
+
+function Parser:parseReturnStatement()
+    self:expect("Keyword", "return")
+    local args = {}
+    local stop = { ["end"] = true, ["until"] = true, ["else"] = true, ["elseif"] = true, Eof = true }
+    if not stop[self.current.kind] and not (self.current.kind == "Keyword" and stop[self.current.value]) then
+        table.insert(args, self:parseExpression())
+        while self.current.kind == "Symbol" and self.current.value == "," do
+            self:advance()
+            table.insert(args, self:parseExpression())
+        end
+    end
+    return Ast.ReturnStatement(args)
+end
+
+function Parser:parseDoStatement()
+    self:expect("Keyword", "do")
+    local body = self:parseBlock({ ["end"] = true })
+    self:expect("Keyword", "end")
+    return Ast.DoStatement(body)
+end
+
+function Parser:parseLabel()
+    self:expect("Symbol", "::")
+    self:expect("Ident")
+    self:expect("Symbol", "::")
+    return Ast.NopStatement()
+end
+
+function Parser:parseAssignmentOrCallStatement()
+    local lhs = {}
+    local firstExpr = self:parsePrimary(true)
+    if (firstExpr.kind == AstKind.FunctionCallExpression or firstExpr.kind == AstKind.PassSelfFunctionCallExpression)
+        and not self:isAssignmentOperator() then
+        if firstExpr.kind == AstKind.PassSelfFunctionCallExpression then
+            return Ast.PassSelfFunctionCallStatement(firstExpr.base, firstExpr.passSelfFunctionName, firstExpr.args)
+        else
+            return Ast.FunctionCallStatement(firstExpr.base, firstExpr.args)
+        end
+    end
+    table.insert(lhs, firstExpr)
+    while self.current.kind == "Symbol" and self.current.value == "," do
+        self:advance()
+        table.insert(lhs, self:parsePrimary(true))
+    end
+    local op = self.current.value
+    if op == "=" then
+        self:advance()
+        local rhs = { self:parseExpression() }
+        while self.current.kind == "Symbol" and self.current.value == "," do
+            self:advance()
+            table.insert(rhs, self:parseExpression())
+        end
+        local assignLhs = {}
+        for _, node in ipairs(lhs) do
+            if node.kind == AstKind.VariableExpression then
+                table.insert(assignLhs, Ast.AssignmentVariable(node.scope, node.id))
+            elseif node.kind == AstKind.IndexExpression then
+                table.insert(assignLhs, Ast.AssignmentIndexing(node.base, node.index))
+            else
+                logger:error("Invalid left-hand side in assignment")
+            end
+        end
+        return Ast.AssignmentStatement(assignLhs, rhs)
+    elseif op == "+=" then self:advance(); return Ast.CompoundAddStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "-=" then self:advance(); return Ast.CompoundSubStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "*=" then self:advance(); return Ast.CompoundMulStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "/=" then self:advance(); return Ast.CompoundDivStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "%=" then self:advance(); return Ast.CompoundModStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "^=" then self:advance(); return Ast.CompoundPowStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    elseif op == "..=" then self:advance(); return Ast.CompoundConcatStatement(self:convertLhs(lhs[1]), { self:parseExpression() })
+    else
+        logger:error("Unexpected token in statement: " .. op)
+    end
+end
+
+function Parser:isAssignmentOperator()
+    local t = self.current
+    if t.kind == "Symbol" then
+        local v = t.value
+        return v == "=" or v == "+=" or v == "-=" or v == "*=" or v == "/=" or v == "%=" or v == "^=" or v == "..="
+    end
+    return false
+end
+
+function Parser:convertLhs(node)
+    if node.kind == AstKind.VariableExpression then
+        return Ast.AssignmentVariable(node.scope, node.id)
+    elseif node.kind == AstKind.IndexExpression then
+        return Ast.AssignmentIndexing(node.base, node.index)
+    else
+        logger:error("Invalid left-hand side")
+    end
+end
+
+function Parser:parseExpression()
+    return self:parseOr()
+end
+
+function Parser:parseOr()
+    local left = self:parseAnd()
+    while self.current.kind == "Keyword" and self.current.value == "or" do
+        self:advance()
+        local right = self:parseAnd()
+        left = Ast.OrExpression(left, right, self.settings.SimplifyConstants)
+    end
+    return left
+end
+
+function Parser:parseAnd()
+    local left = self:parseCompare()
+    while self.current.kind == "Keyword" and self.current.value == "and" do
+        self:advance()
+        local right = self:parseCompare()
+        left = Ast.AndExpression(left, right, self.settings.SimplifyConstants)
+    end
+    return left
+end
+
+function Parser:parseCompare()
+    local left = self:parseConcat()
+    while true do
+        local op = self.current.value
+        if op == "<" then self:advance(); left = Ast.LessThanExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        elseif op == ">" then self:advance(); left = Ast.GreaterThanExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        elseif op == "<=" then self:advance(); left = Ast.LessThanOrEqualsExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        elseif op == ">=" then self:advance(); left = Ast.GreaterThanOrEqualsExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        elseif op == "~=" then self:advance(); left = Ast.NotEqualsExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        elseif op == "==" then self:advance(); left = Ast.EqualsExpression(left, self:parseConcat(), self.settings.SimplifyConstants)
+        else break end
+    end
+    return left
+end
+
+function Parser:parseConcat()
+    local left = self:parseAddSub()
+    while self.current.kind == "Symbol" and self.current.value == ".." do
+        self:advance()
+        local right = self:parseAddSub()
+        left = Ast.StrCatExpression(left, right, self.settings.SimplifyConstants)
+    end
+    return left
+end
+
+function Parser:parseAddSub()
+    local left = self:parseMulDivMod()
+    while true do
+        local op = self.current.value
+        if op == "+" then self:advance(); left = Ast.AddExpression(left, self:parseMulDivMod(), self.settings.SimplifyConstants)
+        elseif op == "-" then self:advance(); left = Ast.SubExpression(left, self:parseMulDivMod(), self.settings.SimplifyConstants)
+        else break end
+    end
+    return left
+end
+
+function Parser:parseMulDivMod()
+    local left = self:parseUnary()
+    while true do
+        local op = self.current.value
+        if op == "*" then self:advance(); left = Ast.MulExpression(left, self:parseUnary(), self.settings.SimplifyConstants)
+        elseif op == "/" then self:advance(); left = Ast.DivExpression(left, self:parseUnary(), self.settings.SimplifyConstants)
+        elseif op == "%" then self:advance(); left = Ast.ModExpression(left, self:parseUnary(), self.settings.SimplifyConstants)
+        else break end
+    end
+    return left
+end
+
+function Parser:parseUnary()
+    if self.current.kind == "Symbol" and self.current.value == "-" then
+        self:advance()
+        local operand = self:parseUnary()
+        return Ast.NegateExpression(operand, self.settings.SimplifyConstants)
+    elseif self.current.kind == "Keyword" and self.current.value == "not" then
+        self:advance()
+        local operand = self:parseUnary()
+        return Ast.NotExpression(operand, self.settings.SimplifyConstants)
+    elseif self.current.kind == "Symbol" and self.current.value == "#" then
+        self:advance()
+        local operand = self:parseUnary()
+        return Ast.LenExpression(operand, self.settings.SimplifyConstants)
+    else
+        return self:parsePower()
+    end
+end
+
+function Parser:parsePower()
+    local left = self:parsePrimary(false)
+    if self.current.kind == "Symbol" and self.current.value == "^" then
+        self:advance()
+        local right = self:parseUnary()
+        return Ast.PowExpression(left, right, self.settings.SimplifyConstants)
+    end
+    return left
+end
+
+function Parser:parsePrimary(allowCall)
+    local tok = self.current
+    if tok.kind == "Keyword" then
+        if tok.value == "nil" then self:advance(); return Ast.NilExpression()
+        elseif tok.value == "true" then self:advance(); return Ast.BooleanExpression(true)
+        elseif tok.value == "false" then self:advance(); return Ast.BooleanExpression(false)
+        elseif tok.value == "function" then return self:parseFunctionLiteral()
+        else logger:error("Unexpected keyword " .. tok.value)
+        end
+    elseif tok.kind == "Number" then
+        self:advance()
+        return Ast.NumberExpression(tok.value)
+    elseif tok.kind == "String" then
+        self:advance()
+        return Ast.StringExpression(tok.value)
+    elseif tok.kind == "Symbol" then
+        if tok.value == "..." then self:advance(); return Ast.VarargExpression()
+        elseif tok.value == "(" then
+            self:advance()
+            local expr = self:parseExpression()
+            self:expect("Symbol", ")")
+            return self:handleCallSuffix(expr)
+        elseif tok.value == "{" then
+            return self:parseTableConstructor()
+        end
+    elseif tok.kind == "Ident" then
+        return self:parseVariableOrCall()
+    end
+    logger:error("Unexpected token in expression: " .. tok.value)
+end
+
+function Parser:parseVariableOrCall()
+    local scope, id = self.currentScope:resolve(self.current.value)
+    local base = Ast.VariableExpression(scope, id)
+    self:advance()
+    return self:handleCallSuffix(base)
+end
+
+function Parser:handleCallSuffix(base)
+    while true do
+        if self.current.kind == "Symbol" and self.current.value == "[" then
+            self:advance()
+            local index = self:parseExpression()
+            self:expect("Symbol", "]")
+            base = Ast.IndexExpression(base, index)
+        elseif self.current.kind == "Symbol" and self.current.value == "." then
+            self:advance()
+            local name = self:expect("Ident").value
+            base = Ast.IndexExpression(base, Ast.StringExpression(name))
+        elseif self.current.kind == "Symbol" and self.current.value == ":" then
+            self:advance()
+            local method = self:expect("Ident").value
+            self:expect("Symbol", "(")
+            local args = self:parseExpressionList()
+            self:expect("Symbol", ")")
+            base = Ast.PassSelfFunctionCallExpression(base, method, args)
+        elseif self.current.kind == "Symbol" and self.current.value == "(" then
+            self:advance()
+            local args = self:parseExpressionList()
+            self:expect("Symbol", ")")
+            base = Ast.FunctionCallExpression(base, args)
+        elseif self.current.kind == "String" or self.current.kind == "Symbol" and self.current.value == "{" then
+            local arg
+            if self.current.kind == "String" then
+                arg = Ast.StringExpression(self.current.value)
+                self:advance()
+            else
+                arg = self:parseTableConstructor()
+            end
+            base = Ast.FunctionCallExpression(base, { arg })
+        else
+            break
+        end
+    end
+    return base
+end
+
+function Parser:parseExpressionList()
+    local list = {}
+    if self.current.kind == "Symbol" and self.current.value == ")" then
+        return list
+    end
+    table.insert(list, self:parseExpression())
+    while self.current.kind == "Symbol" and self.current.value == "," do
+        self:advance()
+        table.insert(list, self:parseExpression())
+    end
+    return list
+end
+
+function Parser:parseTableConstructor()
+    self:expect("Symbol", "{")
+    local entries = {}
+    if self.current.kind ~= "Symbol" or self.current.value ~= "}" then
+        while true do
+            if self.current.kind == "Symbol" and self.current.value == "}" then break end
+            local expr = self:parseExpression()
+            if self.current.kind == "Symbol" and self.current.value == "=" then
+                self:advance()
+                local value = self:parseExpression()
+                table.insert(entries, Ast.KeyedTableEntry(expr, value))
+            else
+                table.insert(entries, Ast.TableEntry(expr))
+            end
+            if self.current.kind == "Symbol" and (self.current.value == "," or self.current.value == ";") then
+                self:advance()
+                if self.current.kind == "Symbol" and self.current.value == "}" then break end
+            else
+                break
+            end
+        end
+    end
+    self:expect("Symbol", "}")
+    return Ast.TableConstructorExpression(entries)
+end
+
+function Parser:parseFunctionLiteral()
+    self:expect("Keyword", "function")
+    self:expect("Symbol", "(")
+    local args = self:parseFunctionArgs()
+    self:expect("Symbol", ")")
+    local body, _ = self:parseFunctionBody(args)
+    self:expect("Keyword", "end")
+    return Ast.FunctionLiteralExpression(args, body)
+end
+
+function Parser:parseFunctionArgs()
+    local args = {}
+    if self.current.kind == "Symbol" and self.current.value == ")" then
+        return args
+    end
+    if self.current.kind == "Symbol" and self.current.value == "..." then
+        table.insert(args, "...")
+        self:advance()
+        if self.current.kind == "Symbol" and self.current.value == ")" then return args end
+        self:expect("Symbol", ",")
+    end
+    while true do
+        local name = self:expect("Ident").value
+        table.insert(args, name)
+        if self.current.kind == "Symbol" and self.current.value == "," then
+            self:advance()
+            if self.current.kind == "Symbol" and self.current.value == "..." then
+                table.insert(args, "...")
+                self:advance()
+                break
+            end
+        else
+            break
+        end
+    end
+    return args
+end
+
+function Parser:parseFunctionBody(args)
+    local newScope = Scope:new(self.currentScope)
+    for _, argName in ipairs(args or {}) do
+        if argName ~= "..." then
+            newScope:addVariable(argName)
+        end
+    end
+    local oldScope = self.currentScope
+    self.currentScope = newScope
+    local body = self:parseBlock({ ["end"] = true })
+    self.currentScope = oldScope
+    return body, newScope
+end
+
 _MODULES["prometheus.parser"] = function() return Parser end
 end
 
--- unparser
+-- generator
 do
-local Unparser = {}
-local config = require("config")
+local Generator = {}
 local Ast = require("prometheus.ast")
-local Enums = require("prometheus.enums")
-local util = require("prometheus.util")
-local logger = require("logger")
-local lookupify = util.lookupify
-local LuaVersion = Enums.LuaVersion
 local AstKind = Ast.AstKind
-Unparser.SPACE = config.SPACE
-Unparser.TAB = config.TAB
-local function escapeString(str) return util.escape(str) end
-function Unparser:new(settings) local lv=settings.LuaVersion or LuaVersion.LuaU local conv=Enums.Conventions[lv] local u={luaVersion=lv,conventions=conv,identCharsLookup=lookupify(conv.IdentChars),numberCharsLookup=lookupify(conv.NumberChars),prettyPrint=settings and settings.PrettyPrint or false,notIdentPattern="[^"..table.concat(conv.IdentChars,"").."]",numberPattern="^["..table.concat(conv.NumberChars,"").."]",highlight=settings and settings.Highlight or false,keywordsLookup=lookupify(conv.Keywords)} setmetatable(u,self) self.__index=self return u end
-function Unparser:isValidIdentifier(src) if string.find(src,self.notIdentPattern) then return false end if string.find(src,self.numberPattern) then return false end if self.keywordsLookup[src] then return false end return #src>0 end
-function Unparser:setPrettyPrint(p) self.prettyPrint=p end
-function Unparser:getPrettyPrint() return self.prettyPrint end
-function Unparser:tabs(i,ws) return self.prettyPrint and string.rep(self.TAB,i) or ws and self.SPACE or "" end
-function Unparser:newline(ws) return self.prettyPrint and "\\n" or ws and self.SPACE or "" end
-function Unparser:whitespaceIfNeeded(following,ws) if self.prettyPrint or self.identCharsLookup[string.sub(following,1,1)] then return ws or self.SPACE end return "" end
-function Unparser:whitespaceIfNeeded2(leading,ws) if self.prettyPrint or self.identCharsLookup[string.sub(leading,#leading,#leading)] then return ws or self.SPACE end return "" end
-function Unparser:optionalWhitespace(ws) return self.prettyPrint and (ws or self.SPACE) or "" end
-function Unparser:whitespace(ws) return self.SPACE or ws end
-function Unparser:unparse(ast) if ast.kind~=AstKind.TopNode then logger:error("Unparser:unparse expects a TopNode") end return self:unparseBlock(ast.body) end
-local function joinParts(parts) return table.concat(parts) end
-function Unparser:unparseBlock(block,tabbing) if #block.statements<1 then return self:whitespace() end local parts={} for i,stmt in ipairs(block.statements) do if stmt.kind~=AstKind.NopStatement then local code=self:unparseStatement(stmt,tabbing) if not self.prettyPrint and #parts>0 and string.sub(code,1,1)=="(" then code=";"..code end local ws=self:whitespaceIfNeeded2(#parts>0 and parts[#parts] or "", self:whitespaceIfNeeded(code,self:newline(true))) if i~=1 then table.insert(parts,ws) end if self.prettyPrint then code=code..";" end table.insert(parts,code) end end return joinParts(parts) end
-function Unparser:unparseStatement(stmt,tabbing) tabbing=tabbing and tabbing+1 or 0 local parts={} local function push(...) for i=1,select("#",...) do table.insert(parts,select(i,...)) end end if stmt.kind==AstKind.ContinueStatement then push("continue") elseif stmt.kind==AstKind.BreakStatement then push("break") elseif stmt.kind==AstKind.DoStatement then local body=self:unparseBlock(stmt.body,tabbing) push("do",self:whitespaceIfNeeded(body,self:newline(true)),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.WhileStatement then local cond=self:unparseExpression(stmt.condition,tabbing) local body=self:unparseBlock(stmt.body,tabbing) push("while",self:whitespaceIfNeeded(cond),cond,self:whitespaceIfNeeded2(cond),"do",self:whitespaceIfNeeded(body,self:newline(true)),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.RepeatStatement then local cond=self:unparseExpression(stmt.condition,tabbing) local body=self:unparseBlock(stmt.body,tabbing) push("repeat",self:whitespaceIfNeeded(body,self:newline(true)),body,self:whitespaceIfNeeded2(body,self:newline()..self:tabs(tabbing,true)),"until",self:whitespaceIfNeeded(cond),cond) elseif stmt.kind==AstKind.ForStatement then local body=self:unparseBlock(stmt.body,tabbing) push("for",self:whitespace(),stmt.scope:getVariableName(stmt.id),self:optionalWhitespace(),"=") push(self:optionalWhitespace(),self:unparseExpression(stmt.initialValue,tabbing),",") push(self:optionalWhitespace(),self:unparseExpression(stmt.finalValue,tabbing),",") local inc=stmt.incrementBy and self:unparseExpression(stmt.incrementBy,tabbing) or "1" push(self:optionalWhitespace(),inc,self:whitespaceIfNeeded2(inc),"do",self:whitespaceIfNeeded(body,self:newline(true)),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.ForInStatement then push("for",self:whitespace()) for i,id in ipairs(stmt.ids) do if i~=1 then push(",",self:optionalWhitespace()) end push(stmt.scope:getVariableName(id)) end push(self:whitespace(),"in") local exprcode=self:unparseExpression(stmt.expressions[1],tabbing) push(self:whitespaceIfNeeded(exprcode),exprcode) for i=2,#stmt.expressions do exprcode=self:unparseExpression(stmt.expressions[i],tabbing) push(",",self:optionalWhitespace(),exprcode) end local body=self:unparseBlock(stmt.body,tabbing) push(self:whitespaceIfNeeded2(#parts>0 and parts[#parts] or ""),"do",self:whitespaceIfNeeded(body,self:newline(true)),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.IfStatement then local cond=self:unparseExpression(stmt.condition,tabbing) local body=self:unparseBlock(stmt.body,tabbing) push("if",self:whitespaceIfNeeded(cond),cond,self:whitespaceIfNeeded2(cond),"then",self:whitespaceIfNeeded(body,self:newline(true)),body) for _,eif in ipairs(stmt.elseifs) do cond=self:unparseExpression(eif.condition,tabbing) body=self:unparseBlock(eif.body,tabbing) local last=#parts>0 and parts[#parts] or "" push(self:newline(false),self:whitespaceIfNeeded2(last,self:tabs(tabbing,true)),"elseif",self:whitespaceIfNeeded(cond),cond,self:whitespaceIfNeeded2(cond),"then",self:whitespaceIfNeeded(body,self:newline(true)),body) end if stmt.elsebody then body=self:unparseBlock(stmt.elsebody,tabbing) local last=#parts>0 and parts[#parts] or "" push(self:newline(false),self:whitespaceIfNeeded2(last,self:tabs(tabbing,true)),"else",self:whitespaceIfNeeded(body,self:newline(true)),body) end push(self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.FunctionDeclaration then local fname=stmt.scope:getVariableName(stmt.id) for _,idx in ipairs(stmt.indices) do fname=fname.."."..idx end push("function",self:whitespace(),fname,"(") for i,arg in ipairs(stmt.args) do if i>1 then push(",",self:optionalWhitespace()) end if arg.kind==AstKind.VarargExpression then push("...") else push(arg.scope:getVariableName(arg.id)) end end push(")") local body=self:unparseBlock(stmt.body,tabbing) push(self:newline(false),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.LocalFunctionDeclaration then local fname=stmt.scope:getVariableName(stmt.id) push("local",self:whitespace(),"function",self:whitespace(),fname,"(") for i,arg in ipairs(stmt.args) do if i>1 then push(",",self:optionalWhitespace()) end if arg.kind==AstKind.VarargExpression then push("...") else push(arg.scope:getVariableName(arg.id)) end end push(")") local body=self:unparseBlock(stmt.body,tabbing) push(self:newline(false),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") elseif stmt.kind==AstKind.LocalVariableDeclaration then push("local",self:whitespace()) for i,id in ipairs(stmt.ids) do if i>1 then push(",",self:optionalWhitespace()) end push(stmt.scope:getVariableName(id)) end if #stmt.expressions>0 then push(self:optionalWhitespace(),"=",self:optionalWhitespace()) for i,e in ipairs(stmt.expressions) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(e,tabbing+1)) end end elseif stmt.kind==AstKind.FunctionCallStatement then if not (stmt.base.kind==AstKind.IndexExpression or stmt.base.kind==AstKind.VariableExpression) then push("(",self:unparseExpression(stmt.base,tabbing),")") else push(self:unparseExpression(stmt.base,tabbing)) end push("(") for i,arg in ipairs(stmt.args) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(arg,tabbing)) end push(")") elseif stmt.kind==AstKind.PassSelfFunctionCallStatement then if not (stmt.base.kind==AstKind.IndexExpression or stmt.base.kind==AstKind.VariableExpression) then push("(",self:unparseExpression(stmt.base,tabbing),")") else push(self:unparseExpression(stmt.base,tabbing)) end push(":",stmt.passSelfFunctionName,"(") for i,arg in ipairs(stmt.args) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(arg,tabbing)) end push(")") elseif stmt.kind==AstKind.AssignmentStatement then for i,pe in ipairs(stmt.lhs) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(pe,tabbing)) end push(self:optionalWhitespace(),"=",self:optionalWhitespace()) for i,e in ipairs(stmt.rhs) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(e,tabbing+1)) end elseif stmt.kind==AstKind.ReturnStatement then push("return") if #stmt.args>0 then local ec=self:unparseExpression(stmt.args[1],tabbing) push(self:whitespaceIfNeeded(ec),ec) for i=2,#stmt.args do ec=self:unparseExpression(stmt.args[i],tabbing) push(",",self:optionalWhitespace(),ec) end end elseif self.luaVersion==LuaVersion.LuaU then local compoundOps={[AstKind.CompoundAddStatement]="+=",[AstKind.CompoundSubStatement]="-=",[AstKind.CompoundMulStatement]="*=",[AstKind.CompoundDivStatement]="/=",[AstKind.CompoundModStatement]="%=",[AstKind.CompoundPowStatement]="^=",[AstKind.CompoundConcatStatement]="..="} local op=compoundOps[stmt.kind] if op then push(self:unparseExpression(stmt.lhs,tabbing),self:optionalWhitespace(),op,self:optionalWhitespace(),self:unparseExpression(stmt.rhs,tabbing)) else logger:error("\""..stmt.kind.."\" is not a valid unparseable statement in "..self.luaVersion) end end return self:tabs(tabbing,false)..joinParts(parts) end
-function Unparser:unparseExpression(expr,tabbing) if expr.isParenthesizedExpression then local unwrapped={} for k,v in pairs(expr) do unwrapped[k]=v end unwrapped.isParenthesizedExpression=nil return "("..self:unparseExpression(unwrapped,tabbing)..")" end local parts={} local function push(...) for i=1,select("#",...) do table.insert(parts,select(i,...)) end end if expr.kind==AstKind.BooleanExpression then return expr.value and "true" or "false" end if expr.kind==AstKind.NumberExpression then local str=tostring(expr.value) if str=="inf" then return "2e1024" end if str=="-inf" then return "-2e1024" end if str:sub(1,2)=="0." then str=str:sub(2) end return str end if expr.kind==AstKind.VariableExpression or expr.kind==AstKind.AssignmentVariable then return expr.scope:getVariableName(expr.id) end if expr.kind==AstKind.StringExpression then return "\""..escapeString(expr.value).."\"" end if expr.kind==AstKind.NilExpression then return "nil" end if expr.kind==AstKind.VarargExpression then return "..." end local k=AstKind.OrExpression if expr.kind==k then local lhs=self:unparseExpression(expr.lhs,tabbing) local rhs=self:unparseExpression(expr.rhs,tabbing) return lhs..self:whitespaceIfNeeded2(lhs).."or"..self:whitespaceIfNeeded(rhs)..rhs end k=AstKind.AndExpression if expr.kind==k then local lhs=self:unparseExpression(expr.lhs,tabbing) if Ast.astKindExpressionToNumber(expr.lhs.kind)>=Ast.astKindExpressionToNumber(k) then lhs="("..lhs..")" end local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end return lhs..self:whitespaceIfNeeded2(lhs).."and"..self:whitespaceIfNeeded(rhs)..rhs end local compOps={[AstKind.LessThanExpression]="<",[AstKind.GreaterThanExpression]=">",[AstKind.LessThanOrEqualsExpression]="<=",[AstKind.GreaterThanOrEqualsExpression]=">=",[AstKind.NotEqualsExpression]="~=",[AstKind.EqualsExpression]="=="} local op=compOps[expr.kind] if op then k=expr.kind local lhs=self:unparseExpression(expr.lhs,tabbing) if Ast.astKindExpressionToNumber(expr.lhs.kind)>=Ast.astKindExpressionToNumber(k) then lhs="("..lhs..")" end local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end return lhs..self:optionalWhitespace()..op..self:optionalWhitespace()..rhs end k=AstKind.StrCatExpression if expr.kind==k then local lhs=self:unparseExpression(expr.lhs,tabbing) if Ast.astKindExpressionToNumber(expr.lhs.kind)>=Ast.astKindExpressionToNumber(k) then lhs="("..lhs..")" end local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end if self.numberCharsLookup[string.sub(lhs,#lhs,#lhs)] then lhs=lhs.." " end return lhs..self:optionalWhitespace()..(tostring(rhs):sub(1,1)=="." and ".. " or "..")..self:optionalWhitespace()..rhs end local arithOps={[AstKind.AddExpression]="+",[AstKind.SubExpression]="-",[AstKind.MulExpression]="*",[AstKind.DivExpression]="/",[AstKind.ModExpression]="%",[AstKind.PowExpression]="^"} op=arithOps[expr.kind] if op then k=expr.kind local lhs=self:unparseExpression(expr.lhs,tabbing) if Ast.astKindExpressionToNumber(expr.lhs.kind)>=Ast.astKindExpressionToNumber(k) then lhs="("..lhs..")" end local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end if op=="-" and string.sub(rhs,1,1)=="-" then rhs="("..rhs..")" end return lhs..self:optionalWhitespace()..op..self:optionalWhitespace()..rhs end k=AstKind.NotExpression if expr.kind==k then local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end return "not"..self:whitespaceIfNeeded(rhs)..rhs end k=AstKind.NegateExpression if expr.kind==k then local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end if string.sub(rhs,1,1)=="-" then rhs="("..rhs..")" end return "-"..rhs end k=AstKind.LenExpression if expr.kind==k then local rhs=self:unparseExpression(expr.rhs,tabbing) if Ast.astKindExpressionToNumber(expr.rhs.kind)>=Ast.astKindExpressionToNumber(k) then rhs="("..rhs..")" end return "#"..rhs end k=AstKind.IndexExpression if expr.kind==k or expr.kind==AstKind.AssignmentIndexing then local base=self:unparseExpression(expr.base,tabbing) if expr.base.kind==AstKind.VarargExpression or Ast.astKindExpressionToNumber(expr.base.kind)>Ast.astKindExpressionToNumber(k) or expr.base.kind==AstKind.StringExpression or expr.base.kind==AstKind.NumberExpression or expr.base.kind==AstKind.NilExpression then base="("..base..")" end if expr.index.kind==AstKind.StringExpression and self:isValidIdentifier(expr.index.value) then return base.."."..expr.index.value end local idx=self:unparseExpression(expr.index,tabbing) return base.."["..idx.."]" end k=AstKind.FunctionCallExpression if expr.kind==k then if not (expr.base.kind==AstKind.IndexExpression or expr.base.kind==AstKind.VariableExpression) then push("(",self:unparseExpression(expr.base,tabbing),")") else push(self:unparseExpression(expr.base,tabbing)) end push("(") for i,arg in ipairs(expr.args) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(arg,tabbing)) end push(")") return joinParts(parts) end k=AstKind.PassSelfFunctionCallExpression if expr.kind==k then if not (expr.base.kind==AstKind.IndexExpression or expr.base.kind==AstKind.VariableExpression) then push("(",self:unparseExpression(expr.base,tabbing),")") else push(self:unparseExpression(expr.base,tabbing)) end push(":",expr.passSelfFunctionName,"(") for i,arg in ipairs(expr.args) do if i>1 then push(",",self:optionalWhitespace()) end push(self:unparseExpression(arg,tabbing)) end push(")") return joinParts(parts) end k=AstKind.FunctionLiteralExpression if expr.kind==k then push("function","(") for i,arg in ipairs(expr.args) do if i>1 then push(",",self:optionalWhitespace()) end if arg.kind==AstKind.VarargExpression then push("...") else push(arg.scope:getVariableName(arg.id)) end end push(")") local body=self:unparseBlock(expr.body,tabbing) push(self:newline(false),body,self:newline(false),self:whitespaceIfNeeded2(body,self:tabs(tabbing,true)),"end") return joinParts(parts) end k=AstKind.TableConstructorExpression if expr.kind==k then if #expr.entries==0 then return "{}" end local inline=#expr.entries<=3 local tabT=tabbing+1 push("{") if inline then push(self:optionalWhitespace()) else push(self:optionalWhitespace(self:newline()..self:tabs(tabT))) end local p=false for i,entry in ipairs(expr.entries) do p=true local sep=self.prettyPrint and "," or (math.random(1,2)==1 and "," or ";") if i>1 and not inline then push(sep,self:optionalWhitespace(self:newline()..self:tabs(tabT))) elseif i>1 then push(sep,self:optionalWhitespace()) end if entry.kind==AstKind.KeyedTableEntry then if entry.key.kind==AstKind.StringExpression and self:isValidIdentifier(entry.key.value) then push(entry.key.value) else push("[",self:unparseExpression(entry.key,tabT),"]") end push(self:optionalWhitespace(),"=",self:optionalWhitespace(),self:unparseExpression(entry.value,tabT)) else push(self:unparseExpression(entry.value,tabT)) end end if inline then return joinParts(parts)..self:optionalWhitespace().."}" end return joinParts(parts)..self:optionalWhitespace((p and "," or "")..self:newline()..self:tabs(tabbing)).."}" end if self.luaVersion==LuaVersion.LuaU then k=AstKind.IfElseExpression if expr.kind==k then push("if ") push(self:unparseExpression(expr.condition)) push(" then ") push(self:unparseExpression(expr.true_value)) for _,eif in pairs(expr.elseifs) do push(" elseif ") push(self:unparseExpression(eif.condition)) push(" then ") push(self:unparseExpression(eif.value)) end push(" else ") push(self:unparseExpression(expr.false_value)) return joinParts(parts) end end logger:error("\""..expr.kind.."\" is not a valid unparseable expression") end
-_MODULES["prometheus.unparser"] = function() return Unparser end
-end
 
--- step base
-do
-local Step = {}
-local logger = require("logger")
-local util = require("prometheus.util")
-local lookupify = util.lookupify
-Step.SettingsDescriptor = {}
-function Step:new(settings) local inst={} setmetatable(inst,self) self.__index=self if type(settings)~="table" then settings={} end for key,data in pairs(self.SettingsDescriptor) do local val=settings[key] if val==nil and type(data.aliases)=="table" then for _,alias in ipairs(data.aliases) do if settings[alias]~=nil then val=settings[alias] break end end end if val==nil then if data.default==nil then logger:error(string.format("The Setting \"%s\" was not provided for the Step \"%s\"",key,self.Name)) end inst[key]=data.default elseif data.type=="enum" then local look=lookupify(data.values) if not look[val] then logger:error(string.format("Invalid value for the Setting \"%s\" of the Step \"%s\". It must be one of: %s",key,self.Name,table.concat(data,", "))) end inst[key]=val elseif type(val)~=data.type then logger:error(string.format("Invalid value for the Setting \"%s\" of the Step \"%s\". It must be a %s",key,self.Name,data.type)) else if data.min and val<data.min then logger:error(string.format("Invalid value for the Setting \"%s\" of the Step \"%s\". It must be at least %d",key,self.Name,data.min)) end if data.max and val>data.max then logger:error(string.format("Invalid value for the Setting \"%s\" of the Step \"%s\". The biggest allowed value is %d",key,self.Name,data.max)) end inst[key]=val end end inst:init() return inst end
-function Step:init() logger:error("Abstract Steps cannot be Created") end
-function Step:extend() local ext={} setmetatable(ext,self) self.__index=self return ext end
-function Step:apply(ast,pipeline) logger:error("Abstract Steps cannot be Applied") end
-Step.Name="Abstract Step"
-Step.Description="Abstract Step"
-_MODULES["prometheus.step"] = function() return Step end
-end
-
--- randomStrings
-do
-local randomStrings = {}
-local Ast = require("prometheus.ast")
-local utils = require("prometheus.util")
-local charset = utils.chararray("qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM1234567890")
-function randomStrings.randomString(wordsOrLen) if type(wordsOrLen)=="table" then return wordsOrLen[math.random(1,#wordsOrLen)] end wordsOrLen=wordsOrLen or math.random(2,15) if wordsOrLen>0 then return randomStrings.randomString(wordsOrLen-1)..charset[math.random(1,#charset)] else return "" end end
-function randomStrings.randomStringNode(wordsOrLen) return Ast.StringExpression(randomStrings.randomString(wordsOrLen)) end
-_MODULES["prometheus.randomStrings"] = function() return randomStrings end
-end
-
--- randomLiterals
-do
-local RandomLiterals = {}
-local Ast = require("prometheus.ast")
-local RandomStrings = require("prometheus.randomStrings")
-function RandomLiterals.String(pipeline) return Ast.StringExpression(pipeline.namegenerator.generateName(math.random(1,4096))) end
-function RandomLiterals.Dictionary() return RandomStrings.randomStringNode(true) end
-function RandomLiterals.Number() return Ast.NumberExpression(math.random(-8388608,8388607)) end
-function RandomLiterals.Any(pipeline) local t=math.random(1,3) if t==1 then return RandomLiterals.String(pipeline) elseif t==2 then return RandomLiterals.Number() else return RandomLiterals.Dictionary() end end
-_MODULES["prometheus.randomLiterals"] = function() return RandomLiterals end
-end
-
--- visitast
-do
-local visitAst
-local Ast = require("prometheus.ast")
-local util = require("prometheus.util")
-local AstKind = Ast.AstKind
-local lookupify = util.lookupify
-local compundStats = lookupify{AstKind.CompoundAddStatement,AstKind.CompoundSubStatement,AstKind.CompoundMulStatement,AstKind.CompoundDivStatement,AstKind.CompoundModStatement,AstKind.CompoundPowStatement,AstKind.CompoundConcatStatement}
-local binaryExpressions = lookupify{AstKind.OrExpression,AstKind.AndExpression,AstKind.LessThanExpression,AstKind.GreaterThanExpression,AstKind.LessThanOrEqualsExpression,AstKind.GreaterThanOrEqualsExpression,AstKind.NotEqualsExpression,AstKind.EqualsExpression,AstKind.StrCatExpression,AstKind.AddExpression,AstKind.SubExpression,AstKind.MulExpression,AstKind.DivExpression,AstKind.ModExpression,AstKind.PowExpression}
-function visitAst(ast,previsit,postvisit,data) ast.isAst=true data=data or {} data.scopeStack={} data.functionData={depth=0,scope=ast.body.scope,node=ast} data.scope=ast.globalScope data.globalScope=ast.globalScope if type(previsit)=="function" then local node,skip=previsit(ast,data) ast=node or ast if skip then return ast end end visitBlock(ast.body,previsit,postvisit,data,true) if type(postvisit)=="function" then ast=postvisit(ast,data) or ast end return ast end
-function visitBlock(block,previsit,postvisit,data,isFunctionBlock) block.isBlock=true block.isFunctionBlock=isFunctionBlock or false data.scope=block.scope local parentBlockData=data.blockData data.blockData={} table.insert(data.scopeStack,block.scope) if type(previsit)=="function" then local node,skip=previsit(block,data) block=node or block if skip then data.scope=table.remove(data.scopeStack) return block end end local i=1 while i<=#block.statements do local stmt=table.remove(block.statements,i) i=i-1 local returned={visitStatement(stmt,previsit,postvisit,data)} for j,stmt in ipairs(returned) do i=i+1 table.insert(block.statements,i,stmt) end i=i+1 end if type(postvisit)=="function" then block=postvisit(block,data) or block end data.scope=table.remove(data.scopeStack) data.blockData=parentBlockData return block end
-function visitStatement(stmt,previsit,postvisit,data) stmt.isStatement=true if type(previsit)=="function" then local node,skip=previsit(stmt,data) stmt=node or stmt if skip then return stmt end end if stmt.kind==AstKind.ReturnStatement then for i,e in ipairs(stmt.args) do stmt.args[i]=visitExpression(e,previsit,postvisit,data) end elseif stmt.kind==AstKind.PassSelfFunctionCallStatement or stmt.kind==AstKind.FunctionCallStatement then stmt.base=visitExpression(stmt.base,previsit,postvisit,data) for i,e in ipairs(stmt.args) do stmt.args[i]=visitExpression(e,previsit,postvisit,data) end elseif stmt.kind==AstKind.AssignmentStatement then for i,pe in ipairs(stmt.lhs) do stmt.lhs[i]=visitExpression(pe,previsit,postvisit,data) end for i,e in ipairs(stmt.rhs) do stmt.rhs[i]=visitExpression(e,previsit,postvisit,data) end elseif stmt.kind==AstKind.FunctionDeclaration or stmt.kind==AstKind.LocalFunctionDeclaration then local parent=data.functionData data.functionData={depth=parent.depth+1,scope=stmt.body.scope,node=stmt} stmt.body=visitBlock(stmt.body,previsit,postvisit,data,true) data.functionData=parent elseif stmt.kind==AstKind.DoStatement then stmt.body=visitBlock(stmt.body,previsit,postvisit,data,false) elseif stmt.kind==AstKind.WhileStatement then stmt.condition=visitExpression(stmt.condition,previsit,postvisit,data) stmt.body=visitBlock(stmt.body,previsit,postvisit,data,false) elseif stmt.kind==AstKind.RepeatStatement then stmt.body=visitBlock(stmt.body,previsit,postvisit,data) stmt.condition=visitExpression(stmt.condition,previsit,postvisit,data) elseif stmt.kind==AstKind.ForStatement then stmt.initialValue=visitExpression(stmt.initialValue,previsit,postvisit,data) stmt.finalValue=visitExpression(stmt.finalValue,previsit,postvisit,data) stmt.incrementBy=visitExpression(stmt.incrementBy,previsit,postvisit,data) stmt.body=visitBlock(stmt.body,previsit,postvisit,data,false) elseif stmt.kind==AstKind.ForInStatement then for i,e in ipairs(stmt.expressions) do stmt.expressions[i]=visitExpression(e,previsit,postvisit,data) end stmt.body=visitBlock(stmt.body,previsit,postvisit,data,false) elseif stmt.kind==AstKind.IfStatement then stmt.condition=visitExpression(stmt.condition,previsit,postvisit,data) stmt.body=visitBlock(stmt.body,previsit,postvisit,data,false) for i,eif in ipairs(stmt.elseifs) do eif.condition=visitExpression(eif.condition,previsit,postvisit,data) eif.body=visitBlock(eif.body,previsit,postvisit,data,false) end if stmt.elsebody then stmt.elsebody=visitBlock(stmt.elsebody,previsit,postvisit,data,false) end elseif stmt.kind==AstKind.LocalVariableDeclaration then for i,e in ipairs(stmt.expressions) do stmt.expressions[i]=visitExpression(e,previsit,postvisit,data) end elseif compundStats[stmt.kind] then stmt.lhs=visitExpression(stmt.lhs,previsit,postvisit,data) stmt.rhs=visitExpression(stmt.rhs,previsit,postvisit,data) end if type(postvisit)=="function" then local stmts={postvisit(stmt,data)} if #stmts>0 then return unpack(stmts) end end return stmt end
-function visitExpression(expr,previsit,postvisit,data) expr.isExpression=true if type(previsit)=="function" then local node,skip=previsit(expr,data) expr=node or expr if skip then return expr end end if binaryExpressions[expr.kind] then expr.lhs=visitExpression(expr.lhs,previsit,postvisit,data) expr.rhs=visitExpression(expr.rhs,previsit,postvisit,data) end if expr.kind==AstKind.NotExpression or expr.kind==AstKind.NegateExpression or expr.kind==AstKind.LenExpression then expr.rhs=visitExpression(expr.rhs,previsit,postvisit,data) end if expr.kind==AstKind.PassSelfFunctionCallExpression or expr.kind==AstKind.FunctionCallExpression then expr.base=visitExpression(expr.base,previsit,postvisit,data) for i,a in ipairs(expr.args) do expr.args[i]=visitExpression(a,previsit,postvisit,data) end end if expr.kind==AstKind.FunctionLiteralExpression then local parent=data.functionData data.functionData={depth=parent.depth+1,scope=expr.body.scope,node=expr} expr.body=visitBlock(expr.body,previsit,postvisit,data,true) data.functionData=parent end if expr.kind==AstKind.TableConstructorExpression then for i,entry in ipairs(expr.entries) do if entry.kind==AstKind.KeyedTableEntry then entry.key=visitExpression(entry.key,previsit,postvisit,data) end entry.value=visitExpression(entry.value,previsit,postvisit,data) end end if expr.kind==AstKind.IndexExpression or expr.kind==AstKind.AssignmentIndexing then expr.base=visitExpression(expr.base,previsit,postvisit,data) expr.index=visitExpression(expr.index,previsit,postvisit,data) end if expr.kind==AstKind.IfElseExpression then expr.condition=visitExpression(expr.condition,previsit,postvisit,data) expr.true_value=visitExpression(expr.true_value,previsit,postvisit,data) for _,elif in pairs(expr.elseifs) do elif.condition=visitExpression(elif.condition,previsit,postvisit,data) elif.value=visitExpression(elif.value,previsit,postvisit,data) end expr.false_value=visitExpression(expr.false_value,previsit,postvisit,data) end if type(postvisit)=="function" then expr=postvisit(expr,data) or expr end return expr end
-_MODULES["prometheus.visitast"] = function() return visitAst end
-end
-
--- config
-do
-local config = {}
-config.Name = "Prometheus"
-config.NameUpper = "PROMETHEUS"
-config.NameAndVersion = "Prometheus v0.2"
-config.Version = "v0.2"
-config.Revision = "Alpha"
-config.IdentPrefix = "__prometheus_"
-config.SPACE = " "
-config.TAB = "\\t"
-for _,arg in pairs(arg) do if arg=="--CI" then local rn=string.gsub(string.format("%s %s %s", config.Name, config.Revision, config.Version),"%s","-") print(rn) end if arg=="--FullVersion" then print(config.Version) end end
-_MODULES["config"] = function() return config end
-end
-
--- logger
-local logger = {}
-local config = require("config")
-local colors = require("colors")
-logger.LogLevel = { Error=0, Warn=1, Log=2, Info=2, Debug=3 }
-logger.logLevel = logger.LogLevel.Log
-logger.debugCallback = function(...) print(colors(config.NameUpper .. ": " .. ..., "grey")) end
-function logger:debug(...) if self.logLevel>=self.LogLevel.Debug then self.debugCallback(...) end end
-logger.logCallback = function(...) print(colors(config.NameUpper .. ": ", "magenta") .. ...) end
-function logger:log(...) if self.logLevel>=self.LogLevel.Log then self.logCallback(...) end end
-function logger:info(...) if self.logLevel>=self.LogLevel.Log then self.logCallback(...) end end
-logger.warnCallback = function(...) print(colors(config.NameUpper .. ": " .. ..., "yellow")) end
-function logger:warn(...) if self.logLevel>=self.LogLevel.Warn then self.warnCallback(...) end end
-logger.errorCallback = function(...) print(colors(config.NameUpper .. ": " .. ..., "red")) error(...) end
-function logger:error(...) self.errorCallback(...) error(config.NameUpper..": logger.errorCallback did not throw an Error!") end
-_MODULES["logger"] = function() return logger end
--- colors
-do
-local colors = {}
-local keys = { reset=0, bright=1, dim=2, underline=4, blink=5, reverse=7, hidden=8, black=30, pink=91, red=31, green=32, yellow=33, blue=34, magenta=35, cyan=36, grey=37, gray=37, white=97, blackbg=40, redbg=41, greenbg=42, yellowbg=43, bluebg=44, magentabg=45, cyanbg=46, greybg=47, graybg=47, whitebg=107 }
-local escapeString = string.char(27).."[%dm"
-local function escapeNumber(n) return escapeString:format(n) end
-local settings = { enabled = true }
-local function colorize(str,...) if not settings.enabled then return str end str=tostring(str or "") local escs={} for _,name in ipairs({...}) do table.insert(escs,escapeNumber(keys[name])) end return escapeNumber(keys.reset)..table.concat(escs)..str..escapeNumber(keys.reset) end
-return setmetatable(settings, { __call = function(_,...) return colorize(...) end })
-_MODULES["colors"] = function() return colors end
-end
-
--- highlightlua (simplified)
-do
-local highlight = function(code,lv) return code end
-_MODULES["highlightlua"] = function() return highlight end
-end
-
--- presets
-do
-local presets = {
-  Minify = { LuaVersion="Lua51", VarNamePrefix="", NameGenerator="MangledShuffled", PrettyPrint=false, Seed=0, Steps={} },
-  Weak = { LuaVersion="Lua51", VarNamePrefix="", NameGenerator="MangledShuffled", PrettyPrint=false, Seed=0, Steps={ {Name="Vmify",Settings={}}, {Name="ConstantArray",Settings={Threshold=1,StringsOnly=true}}, {Name="WrapInFunction",Settings={}} } },
-  Vmify = { LuaVersion="Lua51", VarNamePrefix="", NameGenerator="MangledShuffled", PrettyPrint=false, Seed=0, Steps={ {Name="Vmify",Settings={}} } },
-  Medium = { LuaVersion="Lua51", VarNamePrefix="", NameGenerator="MangledShuffled", PrettyPrint=false, Seed=0, Steps={ {Name="EncryptStrings",Settings={}}, {Name="AntiTamper",Settings={UseDebug=false}}, {Name="Vmify",Settings={}}, {Name="ConstantArray",Settings={Threshold=1,StringsOnly=true,Shuffle=true,Rotate=true,LocalWrapperThreshold=0}}, {Name="NumbersToExpressions",Settings={}}, {Name="WrapInFunction",Settings={}} } },
-  Strong = { LuaVersion="Lua51", VarNamePrefix="", NameGenerator="MangledShuffled", PrettyPrint=false, Seed=0, Steps={ {Name="Vmify",Settings={}}, {Name="EncryptStrings",Settings={}}, {Name="AntiTamper",Settings={UseDebug=false}}, {Name="Vmify",Settings={}}, {Name="ConstantArray",Settings={Threshold=1,StringsOnly=true,Shuffle=true,Rotate=true,LocalWrapperThreshold=0}}, {Name="NumbersToExpressions",Settings={NumberRepresentationMutation=true}}, {Name="WrapInFunction",Settings={}} } },
+local precedence = {
+    [AstKind.OrExpression] = 12,
+    [AstKind.AndExpression] = 11,
+    [AstKind.LessThanExpression] = 10,
+    [AstKind.GreaterThanExpression] = 10,
+    [AstKind.LessThanOrEqualsExpression] = 10,
+    [AstKind.GreaterThanOrEqualsExpression] = 10,
+    [AstKind.NotEqualsExpression] = 10,
+    [AstKind.EqualsExpression] = 10,
+    [AstKind.StrCatExpression] = 9,
+    [AstKind.AddExpression] = 8,
+    [AstKind.SubExpression] = 8,
+    [AstKind.MulExpression] = 7,
+    [AstKind.DivExpression] = 7,
+    [AstKind.ModExpression] = 7,
+    [AstKind.NotExpression] = 5,
+    [AstKind.LenExpression] = 5,
+    [AstKind.NegateExpression] = 5,
+    [AstKind.PowExpression] = 4,
+    [AstKind.IndexExpression] = 1,
+    [AstKind.FunctionCallExpression] = 2,
+    [AstKind.PassSelfFunctionCallExpression] = 2,
 }
-_MODULES["presets"] = function() return presets end
+
+function Generator:new(ast, settings)
+    local g = { ast = ast, settings = settings or {}, indent = 0, output = {} }
+    setmetatable(g, {__index = Generator})
+    return g
 end
 
--- namegenerators
-do
-local function mangled(i) return "v"..tostring(i) end
-local function mangledShuffled(i) return "x"..tostring(i) end
-local function il(i) local chars={"i","l","I","L","1"} return chars[(i%#chars)+1] end
-local function number(i) return "_"..i end
-local function confuse(i) return "v"..tostring(i) end
-local namegens = { Mangled=mangled, MangledShuffled=mangledShuffled, Il=il, Number=number, Confuse=confuse }
-_MODULES["prometheus.namegenerators"] = function() return namegens end
+function Generator:write(str)
+    table.insert(self.output, str)
 end
 
--- steps (all steps)
+function Generator:newline()
+    self:write("\n" .. string.rep("    ", self.indent))
+end
+
+function Generator:generate()
+    self:generateNode(self.ast)
+    return table.concat(self.output)
+end
+
+function Generator:generateNode(node)
+    if not node then return end
+    local kind = node.kind
+    if kind == AstKind.TopNode then
+        self:generateNode(node.body)
+    elseif kind == AstKind.Block then
+        for _, stmt in ipairs(node.statements) do
+            self:generateNode(stmt)
+            self:newline()
+        end
+    elseif kind == AstKind.NopStatement then
+        self:write(";")
+    elseif kind == AstKind.DoStatement then
+        self:write("do")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.WhileStatement then
+        self:write("while ")
+        self:generateExpression(node.condition)
+        self:write(" do")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.RepeatStatement then
+        self:write("repeat")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("until ")
+        self:generateExpression(node.condition)
+    elseif kind == AstKind.IfStatement then
+        self:write("if ")
+        self:generateExpression(node.condition)
+        self:write(" then")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        for _, elseifClause in ipairs(node.elseifs or {}) do
+            self:newline()
+            self:write("elseif ")
+            self:generateExpression(elseifClause.condition)
+            self:write(" then")
+            self.indent = self.indent + 1
+            self:newline()
+            self:generateNode(elseifClause.body)
+            self.indent = self.indent - 1
+        end
+        if node.elsebody then
+            self:newline()
+            self:write("else")
+            self.indent = self.indent + 1
+            self:newline()
+            self:generateNode(node.elsebody)
+            self.indent = self.indent - 1
+        end
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.ForStatement then
+        self:write("for ")
+        self:write(node.scope:getVariableName(node.id))
+        self:write(" = ")
+        self:generateExpression(node.initialValue)
+        self:write(", ")
+        self:generateExpression(node.finalValue)
+        if node.incrementBy and not (node.incrementBy.kind == AstKind.NumberExpression and node.incrementBy.value == 1) then
+            self:write(", ")
+            self:generateExpression(node.incrementBy)
+        end
+        self:write(" do")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.ForInStatement then
+        self:write("for ")
+        for i, id in ipairs(node.ids) do
+            if i > 1 then self:write(", ") end
+            self:write(node.scope:getVariableName(id))
+        end
+        self:write(" in ")
+        for i, expr in ipairs(node.expressions) do
+            if i > 1 then self:write(", ") end
+            self:generateExpression(expr)
+        end
+        self:write(" do")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.FunctionDeclaration then
+        self:write("function ")
+        self:write(node.scope:getVariableName(node.id))
+        for _, idx in ipairs(node.indices or {}) do
+            self:write("." .. idx)
+        end
+        self:write("(")
+        self:write(table.concat(node.args, ", "))
+        self:write(")")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.LocalFunctionDeclaration then
+        self:write("local function ")
+        self:write(node.scope:getVariableName(node.id))
+        self:write("(")
+        self:write(table.concat(node.args, ", "))
+        self:write(")")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.LocalVariableDeclaration then
+        self:write("local ")
+        for i, id in ipairs(node.ids) do
+            if i > 1 then self:write(", ") end
+            self:write(node.scope:getVariableName(id))
+        end
+        if #node.expressions > 0 then
+            self:write(" = ")
+            for i, expr in ipairs(node.expressions) do
+                if i > 1 then self:write(", ") end
+                self:generateExpression(expr)
+            end
+        end
+    elseif kind == AstKind.AssignmentStatement then
+        for i, lhs in ipairs(node.lhs) do
+            if i > 1 then self:write(", ") end
+            self:generateLHS(lhs)
+        end
+        self:write(" = ")
+        for i, expr in ipairs(node.rhs) do
+            if i > 1 then self:write(", ") end
+            self:generateExpression(expr)
+        end
+    elseif kind == AstKind.CompoundAddStatement then
+        self:generateLHS(node.lhs[1]); self:write(" += "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundSubStatement then
+        self:generateLHS(node.lhs[1]); self:write(" -= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundMulStatement then
+        self:generateLHS(node.lhs[1]); self:write(" *= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundDivStatement then
+        self:generateLHS(node.lhs[1]); self:write(" /= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundModStatement then
+        self:generateLHS(node.lhs[1]); self:write(" %= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundPowStatement then
+        self:generateLHS(node.lhs[1]); self:write(" ^= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.CompoundConcatStatement then
+        self:generateLHS(node.lhs[1]); self:write(" ..= "); self:generateExpression(node.rhs[1])
+    elseif kind == AstKind.ReturnStatement then
+        self:write("return")
+        if #node.args > 0 then
+            self:write(" ")
+            for i, expr in ipairs(node.args) do
+                if i > 1 then self:write(", ") end
+                self:generateExpression(expr)
+            end
+        end
+    elseif kind == AstKind.BreakStatement then
+        self:write("break")
+    elseif kind == AstKind.ContinueStatement then
+        self:write("continue")
+    elseif kind == AstKind.FunctionCallStatement then
+        self:generateExpression(node.base)
+        self:write("(")
+        self:generateExpressionList(node.args)
+        self:write(")")
+    elseif kind == AstKind.PassSelfFunctionCallStatement then
+        self:generateExpression(node.base)
+        self:write(":" .. node.passSelfFunctionName)
+        self:write("(")
+        self:generateExpressionList(node.args)
+        self:write(")")
+    elseif kind == AstKind.NilExpression then
+        self:write("nil")
+    elseif kind == AstKind.BooleanExpression then
+        self:write(tostring(node.value))
+    elseif kind == AstKind.NumberExpression then
+        self:write(tostring(node.value))
+    elseif kind == AstKind.StringExpression then
+        self:write(string.format("%q", node.value))
+    elseif kind == AstKind.VarargExpression then
+        self:write("...")
+    elseif kind == AstKind.FunctionLiteralExpression then
+        self:write("function(")
+        self:write(table.concat(node.args, ", "))
+        self:write(")")
+        self.indent = self.indent + 1
+        self:newline()
+        self:generateNode(node.body)
+        self.indent = self.indent - 1
+        self:newline()
+        self:write("end")
+    elseif kind == AstKind.TableConstructorExpression then
+        self:write("{")
+        for i, entry in ipairs(node.entries) do
+            if i > 1 then self:write(", ") end
+            if entry.kind == AstKind.KeyedTableEntry then
+                self:write("[")
+                self:generateExpression(entry.key)
+                self:write("] = ")
+                self:generateExpression(entry.value)
+            else
+                self:generateExpression(entry.value)
+            end
+        end
+        self:write("}")
+    else
+        if precedence[kind] then
+            self:generateExpression(node)
+        else
+            error("Unknown AST node kind: " .. kind)
+        end
+    end
+end
+
+function Generator:generateExpression(node, parentPrec)
+    if not node then return end
+    local prec = precedence[node.kind] or 0
+    local needParen = parentPrec and prec > 0 and prec > parentPrec
+    if needParen then self:write("(") end
+    if node.kind == AstKind.OrExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" or "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.AndExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" and "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.LessThanExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" < "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.GreaterThanExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" > "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.LessThanOrEqualsExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" <= "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.GreaterThanOrEqualsExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" >= "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.NotEqualsExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" ~= "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.EqualsExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" == "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.StrCatExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" .. "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.AddExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" + "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.SubExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" - "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.MulExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" * "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.DivExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" / "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.ModExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" % "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.PowExpression then
+        self:generateExpression(node.lhs, precedence[node.kind]); self:write(" ^ "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.NotExpression then
+        self:write("not "); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.NegateExpression then
+        self:write("-"); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.LenExpression then
+        self:write("#"); self:generateExpression(node.rhs, precedence[node.kind])
+    elseif node.kind == AstKind.IndexExpression then
+        self:generateExpression(node.base, precedence[node.kind]); self:write("["); self:generateExpression(node.index); self:write("]")
+    elseif node.kind == AstKind.FunctionCallExpression then
+        self:generateExpression(node.base, precedence[node.kind]); self:write("("); self:generateExpressionList(node.args); self:write(")")
+    elseif node.kind == AstKind.PassSelfFunctionCallExpression then
+        self:generateExpression(node.base, precedence[node.kind]); self:write(":" .. node.passSelfFunctionName); self:write("("); self:generateExpressionList(node.args); self:write(")")
+    elseif node.kind == AstKind.VariableExpression then
+        self:write(node.scope:getVariableName(node.id))
+    else
+        self:generateNode(node)
+    end
+    if needParen then self:write(")") end
+end
+
+function Generator:generateLHS(node)
+    if node.kind == AstKind.AssignmentVariable then
+        self:write(node.scope:getVariableName(node.id))
+    elseif node.kind == AstKind.AssignmentIndexing then
+        self:generateExpression(node.base); self:write("["); self:generateExpression(node.index); self:write("]")
+    end
+end
+
+function Generator:generateExpressionList(args)
+    for i, expr in ipairs(args) do
+        if i > 1 then self:write(", ") end
+        self:generateExpression(expr)
+    end
+end
+
+_MODULES["prometheus.generator"] = function() return Generator end
+end
+
+-- passes
 do
-local steps = {}
-local Step = require("prometheus.step")
+local passes = {}
 local Ast = require("prometheus.ast")
-local Scope = require("prometheus.scope")
-local visitast = require("prometheus.visitast")
-local RandomLiterals = require("prometheus.randomLiterals")
-local Parser = require("prometheus.parser")
-local Enums = require("prometheus.enums")
-local util = require("prometheus.util")
-local logger = require("logger")
-local RandomStrings = require("prometheus.randomStrings")
-local compiler = require("prometheus.compiler.compiler")
-
--- AddVararg
-local AddVararg = Step:extend()
-AddVararg.Name="Add Vararg"
-AddVararg.Description="This Step Adds Vararg to all Functions"
-AddVararg.SettingsDescriptor={}
-function AddVararg:init() end
-function AddVararg:apply(ast) visitast(ast,nil,function(node) if node.kind==Ast.AstKind.FunctionDeclaration or node.kind==Ast.AstKind.LocalFunctionDeclaration or node.kind==Ast.AstKind.FunctionLiteralExpression then if #node.args<1 or node.args[#node.args].kind~=Ast.AstKind.VarargExpression then node.args[#node.args+1]=Ast.VarargExpression() end end end) end
-steps.AddVararg = AddVararg
-
--- Watermark
-local Watermark = Step:extend()
-Watermark.Name="Watermark"
-Watermark.Description="This Step will add a watermark to the script"
-Watermark.SettingsDescriptor={ Content={type="string",default="This Script is Part of the Prometheus Obfuscator by trieu1082"}, CustomVariable={type="string",default="_WATERMARK"} }
-function Watermark:init() end
-function Watermark:apply(ast) local body=ast.body if #self.Content>0 then local scope,var=ast.globalScope:resolve(self.CustomVariable) local wm=Ast.AssignmentVariable(ast.globalScope,var) local funcScope=Scope:new(body.scope) funcScope:addReferenceToHigherScope(ast.globalScope,var) local arg=funcScope:addVariable() local st=Ast.PassSelfFunctionCallStatement(Ast.StringExpression(self.Content),"gsub",{Ast.StringExpression(".+"),Ast.FunctionLiteralExpression({Ast.VariableExpression(funcScope,arg)},Ast.Block({Ast.AssignmentStatement({wm},{Ast.VariableExpression(funcScope,arg)})},funcScope))}) table.insert(body.statements,1,st) end end
-steps.Watermark = Watermark
-
--- ProxifyLocals
-local ProxifyLocals = Step:extend()
-ProxifyLocals.Name="Proxify Locals"
-ProxifyLocals.Description="This Step wraps all locals into Proxy Objects"
-ProxifyLocals.SettingsDescriptor={ LiteralType={type="enum",values={"dictionary","number","string","any"},default="string"} }
-local function shallowcopy(orig) local t=type(orig) if t=="table" then local c={} for k,v in pairs(orig) do c[k]=v end return c else return orig end end
-local function callNameGenerator(fn,...) if type(fn)=="table" then fn=fn.generateName end return fn(...) end
-local MetatableExpressions = { {constructor=Ast.AddExpression,key="__add"}, {constructor=Ast.SubExpression,key="__sub"}, {constructor=Ast.IndexExpression,key="__index"}, {constructor=Ast.MulExpression,key="__mul"}, {constructor=Ast.DivExpression,key="__div"}, {constructor=Ast.PowExpression,key="__pow"}, {constructor=Ast.StrCatExpression,key="__concat"} }
-function ProxifyLocals:init() end
-local function generateLocalMetatableInfo(pipeline) local used={} local info={} for _,v in ipairs({"setValue","getValue","index"}) do local rop repeat rop=MetatableExpressions[math.random(#MetatableExpressions)] until not used[rop] used[rop]=true info[v]=rop end info.valueName=callNameGenerator(pipeline.namegenerator,math.random(1,4096)) return info end
-function ProxifyLocals:CreateAssignmentExpression(info,expr,parentScope) local metatableVals={} local setValueFunctionScope=Scope:new(parentScope) local setValueSelf=setValueFunctionScope:addVariable() local setValueArg=setValueFunctionScope:addVariable() local setvalueFunctionLiteral=Ast.FunctionLiteralExpression({Ast.VariableExpression(setValueFunctionScope,setValueSelf),Ast.VariableExpression(setValueFunctionScope,setValueArg)},Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(setValueFunctionScope,setValueSelf),Ast.StringExpression(info.valueName))},{Ast.VariableExpression(setValueFunctionScope,setValueArg)})},setValueFunctionScope)) table.insert(metatableVals,Ast.KeyedTableEntry(Ast.StringExpression(info.setValue.key),setvalueFunctionLiteral)) local getValueFunctionScope=Scope:new(parentScope) local getValueSelf=getValueFunctionScope:addVariable() local getValueArg=getValueFunctionScope:addVariable() local getValueIdxExpr if info.getValue.key=="__index" or info.setValue.key=="__index" then getValueIdxExpr=Ast.FunctionCallExpression(Ast.VariableExpression(getValueFunctionScope:resolveGlobal("rawget")),{Ast.VariableExpression(getValueFunctionScope,getValueSelf),Ast.StringExpression(info.valueName)}) else getValueIdxExpr=Ast.IndexExpression(Ast.VariableExpression(getValueFunctionScope,getValueSelf),Ast.StringExpression(info.valueName)) end local getvalueFunctionLiteral=Ast.FunctionLiteralExpression({Ast.VariableExpression(getValueFunctionScope,getValueSelf),Ast.VariableExpression(getValueFunctionScope,getValueArg)},Ast.Block({Ast.ReturnStatement({getValueIdxExpr})},getValueFunctionScope)) table.insert(metatableVals,Ast.KeyedTableEntry(Ast.StringExpression(info.getValue.key),getvalueFunctionLiteral)) parentScope:addReferenceToHigherScope(self.setMetatableVarScope,self.setMetatableVarId) return Ast.FunctionCallExpression(Ast.VariableExpression(self.setMetatableVarScope,self.setMetatableVarId),{Ast.TableConstructorExpression({Ast.KeyedTableEntry(Ast.StringExpression(info.valueName),expr)}),Ast.TableConstructorExpression(metatableVals)}) end
-function ProxifyLocals:apply(ast,pipeline) local localMetatableInfos={} local function getLocalMetatableInfo(scope,id) if scope.isGlobal then return nil end localMetatableInfos[scope]=localMetatableInfos[scope] or {} if localMetatableInfos[scope][id] then if localMetatableInfos[scope][id].locked then return nil end return localMetatableInfos[scope][id] end local info=generateLocalMetatableInfo(pipeline) localMetatableInfos[scope][id]=info return info end
-local function disableMetatableInfo(scope,id) if scope.isGlobal then return nil end localMetatableInfos[scope]=localMetatableInfos[scope] or {} localMetatableInfos[scope][id]={locked=true} end
-self.setMetatableVarScope=ast.body.scope self.setMetatableVarId=ast.body.scope:addVariable() self.emptyFunctionScope=ast.body.scope self.emptyFunctionId=ast.body.scope:addVariable() self.emptyFunctionUsed=false table.insert(ast.body.statements,1,Ast.LocalVariableDeclaration(self.emptyFunctionScope,{self.emptyFunctionId},{Ast.FunctionLiteralExpression({},Ast.Block({},Scope:new(ast.body.scope)))}))
-visitast(ast,function(node,data) if node.kind==Ast.AstKind.ForStatement then disableMetatableInfo(node.scope,node.id) end if node.kind==Ast.AstKind.ForInStatement then for _,id in ipairs(node.ids) do disableMetatableInfo(node.scope,id) end end if node.kind==Ast.AstKind.FunctionDeclaration or node.kind==Ast.AstKind.LocalFunctionDeclaration or node.kind==Ast.AstKind.FunctionLiteralExpression then for _,expr in ipairs(node.args) do if expr.kind==Ast.AstKind.VariableExpression then disableMetatableInfo(expr.scope,expr.id) end end end if node.kind==Ast.AstKind.AssignmentStatement then if #node.lhs==1 and node.lhs[1].kind==Ast.AstKind.AssignmentVariable then local var=node.lhs[1] local info=getLocalMetatableInfo(var.scope,var.id) if info then local args=shallowcopy(node.rhs) local vexp=Ast.VariableExpression(var.scope,var.id) vexp.__ignoreProxifyLocals=true args[1]=info.setValue.constructor(vexp,args[1]) self.emptyFunctionUsed=true data.scope:addReferenceToHigherScope(self.emptyFunctionScope,self.emptyFunctionId) return Ast.FunctionCallStatement(Ast.VariableExpression(self.emptyFunctionScope,self.emptyFunctionId),args) end end end end,function(node,data) if node.kind==Ast.AstKind.LocalVariableDeclaration then for i,id in ipairs(node.ids) do local expr=node.expressions[i] or Ast.NilExpression() local info=getLocalMetatableInfo(node.scope,id) if info then local newExpr=self:CreateAssignmentExpression(info,expr,node.scope) node.expressions[i]=newExpr end end end if node.kind==Ast.AstKind.VariableExpression and not node.__ignoreProxifyLocals then local info=getLocalMetatableInfo(node.scope,node.id) if info then local literal if self.LiteralType=="dictionary" then literal=RandomLiterals.Dictionary() elseif self.LiteralType=="number" then literal=RandomLiterals.Number() elseif self.LiteralType=="string" then literal=RandomLiterals.String(pipeline) else literal=RandomLiterals.Any(pipeline) end return info.getValue.constructor(node,literal) end end if node.kind==Ast.AstKind.AssignmentVariable then local info=getLocalMetatableInfo(node.scope,node.id) if info then return Ast.AssignmentIndexing(node,Ast.StringExpression(info.valueName)) end end if node.kind==Ast.AstKind.LocalFunctionDeclaration then local info=getLocalMetatableInfo(node.scope,node.id) if info then local func=Ast.FunctionLiteralExpression(node.args,node.body) local newExpr=self:CreateAssignmentExpression(info,func,node.scope) return Ast.LocalVariableDeclaration(node.scope,{node.id},{newExpr}) end end if node.kind==Ast.AstKind.FunctionDeclaration then local info=getLocalMetatableInfo(node.scope,node.id) if info then table.insert(node.indices,1,info.valueName) end end end)
-table.insert(ast.body.statements,1,Ast.LocalVariableDeclaration(self.setMetatableVarScope,{self.setMetatableVarId},{Ast.VariableExpression(self.setMetatableVarScope:resolveGlobal("setmetatable"))}))
-end
-steps.ProxifyLocals = ProxifyLocals
-
--- NumbersToExpressions
-local NumbersToExpressions = Step:extend()
-NumbersToExpressions.Name="Numbers To Expressions"
-NumbersToExpressions.Description="This Step Converts number Literals to Expressions"
-NumbersToExpressions.SettingsDescriptor={ Threshold={type="number",default=1,min=0,max=1}, InternalThreshold={type="number",default=0.2,min=0,max=0.8}, NumberRepresentationMutation={type="boolean",default=false}, AllowedNumberRepresentations={type="table",default={"hex","scientific","normal"},values={"hex","binary","scientific","normal"}} }
-local function contains(t,v) for _,x in ipairs(t) do if x==v then return true end end return false end
-function NumbersToExpressions:init() self.ExpressionGenerators={ function(val,depth) local v2=math.random(-2^20,2^20) local diff=val-v2 if tonumber(tostring(diff))+tonumber(tostring(v2))~=val then return false end return Ast.AddExpression(self:CreateNumberExpression(v2,depth),self:CreateNumberExpression(diff,depth),false) end, function(val,depth) local v2=math.random(-2^20,2^20) local diff=val+v2 if tonumber(tostring(diff))-tonumber(tostring(v2))~=val then return false end return Ast.SubExpression(self:CreateNumberExpression(diff,depth),self:CreateNumberExpression(v2,depth),false) end, function(val,depth) local lhs,rhs local rhs=val+math.random(1,2^24) local mult=math.random(1,2^8) lhs=val+(mult*rhs) if tonumber(tostring(lhs))%tonumber(tostring(rhs))~=val then return false end return Ast.ModExpression(self:CreateNumberExpression(lhs,depth),self:CreateNumberExpression(rhs,depth),false) end } end
-function NumbersToExpressions:CreateNumberExpression(val,depth) if depth>0 and math.random()>=self.InternalThreshold or depth>15 then local fmt=self.AllowedNumberRepresentations[math.random(#self.AllowedNumberRepresentations)] if not self.NumberRepresentationMutation then return Ast.NumberExpression(val) end if fmt=="hex" then if val~=math.floor(val) or val<0 then return Ast.NumberExpression(val) end local hs=string.format("0x%X",val) local res="" for i=1,#hs do local c=hs:sub(i,i) if math.random()>0.5 then res=res..c:upper() else res=res..c:lower() end end return Ast.NumberExpression(res) end if fmt=="binary" then if val~=math.floor(val) or val<0 then return Ast.NumberExpression(val) end local bin="" local n=val if n==0 then bin="0" else while n>0 do bin=(n%2)..bin n=math.floor(n/2) end end return Ast.NumberExpression("0b"..bin) end if fmt=="scientific" then if val==0 then return Ast.NumberExpression(val) end local exp=math.floor(math.log10(math.abs(val))) local mant=val/(10^exp) return Ast.NumberExpression(string.format("%.15ge%d",mant,exp)) end if fmt=="normal" then return Ast.NumberExpression(val) end end local gens=util.shuffle({unpack(self.ExpressionGenerators)}) for _,gen in ipairs(gens) do local node=gen(val,depth+1) if node then return node end end return Ast.NumberExpression(val) end
-function NumbersToExpressions:apply(ast) if contains(self.AllowedNumberRepresentations,"binary") then logger:warn("Warning: Binary representation is only supported in Lua 5.2 and above!") end visitast(ast,nil,function(node) if node.kind==Ast.AstKind.NumberExpression then if math.random()<=self.Threshold then return self:CreateNumberExpression(node.value,0) end end end) end
-steps.NumbersToExpressions = NumbersToExpressions
-
--- EncryptStrings
-local EncryptStrings = Step:extend()
-EncryptStrings.Name="Encrypt Strings"
-EncryptStrings.Description="This Step will encrypt strings within your Program."
-EncryptStrings.SettingsDescriptor={}
-function EncryptStrings:init() end
-function EncryptStrings:CreateEncryptionService() local usedSeeds={} local secret_key_6=math.random(0,63) local secret_key_7=math.random(0,127) local secret_key_44=math.random(0,17592186044415) local secret_key_8=math.random(0,255) local floor=math.floor local function primitive_root_257(idx) local g,m,d=1,128,2*idx+1 repeat g,m,d=g*g*(d>=m and 3 or 1)%257,m/2,d%m until m<1 return g end local param_mul_8=primitive_root_257(secret_key_7) local param_mul_45=secret_key_6*4+1 local param_add_45=secret_key_44*2+1 local state_45=0 local state_8=2 local prev_values={} local function set_seed(seed) state_45=seed%35184372088832 state_8=seed%255+2 prev_values={} end local function gen_seed() local seed repeat seed=math.random(0,35184372088832) until not usedSeeds[seed] usedSeeds[seed]=true return seed end local function get_random_32() state_45=(state_45*param_mul_45+param_add_45)%35184372088832 repeat state_8=state_8*param_mul_8%257 until state_8~=1 local r=state_8%32 local n=floor(state_45/2^(13-(state_8-r)/32))%2^32/2^r return floor(n%1*2^32)+floor(n) end local function get_next_pseudo_random_byte() if #prev_values==0 then local rnd=get_random_32() local low_16=rnd%65536 local high_16=(rnd-low_16)/65536 local b1=low_16%256 local b2=(low_16-b1)/256 local b3=high_16%256 local b4=(high_16-b3)/256 prev_values={b1,b2,b3,b4} end return table.remove(prev_values) end local function encrypt(str) local seed=gen_seed() set_seed(seed) local len=#str local out={} local prevVal=secret_key_8 for i=1,len do local byte=string.byte(str,i) out[i]=string.char((byte-(get_next_pseudo_random_byte()+prevVal))%256) prevVal=byte end return table.concat(out),seed end local function genCode() local code="do\n"..table.concat(util.shuffle{"local floor=math.floor","local random=math.random","local remove=table.remove","local char=string.char","local state_45=0","local state_8=2","local charmap={}","local nums={}"},"\n").."\n for i=1,256 do nums[i]=i end repeat local idx=random(1,#nums) local n=remove(nums,idx) charmap[n]=char(n-1) until #nums==0 local prev_values={} local function get_next_pseudo_random_byte() if #prev_values==0 then state_45=(state_45*"..param_mul_45.."+"..param_add_45..")%35184372088832 repeat state_8=state_8*"..param_mul_8.."%257 until state_8~=1 local r=state_8%32 local shift=13-(state_8-r)/32 local n=floor(state_45/2^shift)%4294967296/2^r local rnd=floor(n%1*4294967296)+floor(n) local low_16=rnd%65536 local high_16=(rnd-low_16)/65536 prev_values={low_16%256,(low_16-low_16%256)/256,high_16%256,(high_16-high_16%256)/256} end local prevValuesLen=#prev_values local removed=prev_values[prevValuesLen] prev_values[prevValuesLen]=nil return removed end local realStrings={} STRINGS=setmetatable({},{__index=realStrings,__metatable=nil}) function DECRYPT(str,seed) local realStringsLocal=realStrings if realStringsLocal[seed] then return seed else prev_values={} local chars=charmap state_45=seed%35184372088832 state_8=seed%255+2 local len=#str realStringsLocal[seed]="" local prevVal="..secret_key_8.." local s="" for i=1,len do prevVal=(string.byte(str,i)+get_next_pseudo_random_byte()+prevVal)%256 s=s..chars[prevVal+1] end realStringsLocal[seed]=s end return seed end end" return code end return {encrypt=encrypt,param_mul_45=param_mul_45,param_mul_8=param_mul_8,param_add_45=param_add_45,secret_key_8=secret_key_8,genCode=genCode} end
-function EncryptStrings:apply(ast,pipeline) local Encryptor=self:CreateEncryptionService() local code=Encryptor.genCode() local newAst=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}):parse(code) local doStat=newAst.body.statements[1] local scope=ast.body.scope local decryptVar=scope:addVariable() local stringsVar=scope:addVariable() doStat.body.scope:setParent(ast.body.scope) visitast(newAst,nil,function(node,data) if node.kind==Ast.AstKind.FunctionDeclaration then if node.scope:getVariableName(node.id)=="DECRYPT" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(scope,decryptVar) node.scope=scope node.id=decryptVar end end if node.kind==Ast.AstKind.AssignmentVariable or node.kind==Ast.AstKind.VariableExpression then if node.scope:getVariableName(node.id)=="STRINGS" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(scope,stringsVar) node.scope=scope node.id=stringsVar end end end) visitast(ast,nil,function(node,data) if node.kind==Ast.AstKind.StringExpression then data.scope:addReferenceToHigherScope(scope,stringsVar) data.scope:addReferenceToHigherScope(scope,decryptVar) local enc,seed=Encryptor.encrypt(node.value) return Ast.IndexExpression(Ast.VariableExpression(scope,stringsVar),Ast.FunctionCallExpression(Ast.VariableExpression(scope,decryptVar),{Ast.StringExpression(enc),Ast.NumberExpression(seed)})) end end) table.insert(ast.body.statements,1,doStat) table.insert(ast.body.statements,1,Ast.LocalVariableDeclaration(scope,{decryptVar,stringsVar},{})) return ast end
-steps.EncryptStrings = EncryptStrings
-
--- AntiTamper
-local AntiTamper = Step:extend()
-AntiTamper.Name="Anti Tamper"
-AntiTamper.Description="This Step Breaks your Script when it is modified."
-AntiTamper.SettingsDescriptor={ UseDebug={type="boolean",default=true} }
-local function generateSanityCheck() local sanityCheckAnswers={} local sanityPasses=math.random(1,10) for i=1,sanityPasses do sanityCheckAnswers[i]=(math.random(1,2^24)%2==1) end local primaryCheck=RandomStrings.randomString() local codeParts={} local function addCode(fmt,...) table.insert(codeParts,string.format(fmt,...)) end local function generateAssignment(idx) local index=math.min(idx,sanityPasses) addCode("            valid = %s;\\n",tostring(sanityCheckAnswers[index])) end local function generateValidation(idx) local index=math.min(idx-1,sanityPasses) addCode("            if valid == %s then\\n",tostring(sanityCheckAnswers[index])) addCode("            else\\n") addCode("                while true do end\\n") addCode("            end\\n") end addCode("do local valid = '%s';",primaryCheck) addCode("for i = 0, %d do\\n",sanityPasses) for i=0,sanityPasses do if i==0 then addCode("        if i == 0 then\\n") addCode("            if valid ~= '%s' then\\n",primaryCheck) addCode("                while true do end\\n") addCode("            end\\n") addCode("            valid = %s;\\n",tostring(sanityCheckAnswers[1])) elseif i==1 then addCode("        elseif i == 1 then\\n") addCode("            if valid == %s then\\n",tostring(sanityCheckAnswers[1])) addCode("            end\\n") else addCode("        elseif i == %d then\\n",i) if i%2==0 then generateAssignment(i) else generateValidation(i) end end end addCode("        end\\n") addCode("    end\\n") addCode("do valid = true end\\n") return table.concat(codeParts) end
-function AntiTamper:init() end
-function AntiTamper:apply(ast,pipeline) if pipeline.PrettyPrint then logger:warn(string.format('"%s" cannot be used with PrettyPrint, ignoring "%s"',self.Name,self.Name)) return ast end local code=generateSanityCheck() if self.UseDebug then local string=RandomStrings.randomString() code=code.."\n            -- Anti Beautify\n\t\t\tlocal sethook = debug and debug.sethook or function() end;\n\t\t\tlocal allowedLine = nil;\n\t\t\tlocal called = 0;\n\t\t\tsethook(function(s, line)\n\t\t\t\tif not line then\n\t\t\t\t\treturn\n\t\t\t\tend\n\t\t\t\tcalled = called + 1;\n\t\t\t\tif allowedLine then\n\t\t\t\t\tif allowedLine ~= line then\n\t\t\t\t\t\tsethook(error, \"l\", 5);\n\t\t\t\t\tend\n\t\t\t\telse\n\t\t\t\t\tallowedLine = line;\n\t\t\t\tend\n\t\t\tend, \"l\", 5);\n\t\t\t(function() end)();\n\t\t\t(function() end)();\n\t\t\tsethook();\n\t\t\tif called < 2 then\n\t\t\t\tvalid = false;\n\t\t\tend\n            if called < 2 then\n                valid = false;\n            end\n\n            -- Anti Function Hook\n            local funcs = {pcall, string.char, debug.getinfo, string.dump}\n            for i = 1, #funcs do\n                if debug.getinfo(funcs[i]).what ~= \"C\" then\n                    valid = false;\n                end\n\n                if debug.getupvalue(funcs[i], 1) then\n                    valid = false;\n                end\n\n                if pcall(string.dump, funcs[i]) then\n                    valid = false;\n                end\n            end\n\n            -- Anti Beautify\n            local function getTraceback()\n                local str = (function(arg)\n                    return debug.traceback(arg)\n                end)(\""..string.."\");\n                return str;\n            end\n\n            local traceback = getTraceback();\n            valid = valid and traceback:sub(1, traceback:find(\"\\n\") - 1) == \""..string.."\";\n            local iter = traceback:gmatch(\":(%d*):\");\n            local v, c = iter(), 1;\n            for i in iter do\n                valid = valid and i == v;\n                c = c + 1;\n            end\n            valid = valid and c >= 2;\n        " end code=code.."\n    local gmatch = string.gmatch;\n    local err = function() error(\"Tamper Detected!\") end;\n\n    local pcallIntact2 = false;\n    local pcallIntact = pcall(function()\n        pcallIntact2 = true;\n    end) and pcallIntact2;\n\n    local random = math.random;\n    local tblconcat = table.concat;\n    local unpkg = table and table.unpack or unpack;\n    local n = random(3, 65);\n    local acc1 = 0;\n    local acc2 = 0;\n    local pcallRet = {pcall(function() local a = "..tostring(math.random(1,2^24)).." - \""..RandomStrings.randomString().."\" ^ "..tostring(math.random(1,2^24)).." return \""..RandomStrings.randomString().."\" / a; end)};\n    local origMsg = pcallRet[2];\n    local line = tonumber(gmatch(tostring(origMsg), ':(%d*):')());\n    for i = 1, n do\n        local len = math.random(1, 100);\n        local n2 = random(0, 255);\n        local pos = random(1, len);\n        local shouldErr = random(1, 2) == 1;\n        local msg = origMsg:gsub(':(%d*):', ':' .. tostring(random(0, 10000)) .. ':');\n        local arr = {pcall(function()\n            if random(1, 2) == 1 or i == n then\n                local line2 = tonumber(gmatch(tostring(({pcall(function() local a = "..tostring(math.random(1,2^24)).." - \""..RandomStrings.randomString().."\" ^ "..tostring(math.random(1,2^24)).." return \""..RandomStrings.randomString().."\" / a; end)})[2]), ':(%d*):')());\n                valid = valid and line == line2;\n            end\n            if shouldErr then\n                error(msg, 0);\n            end\n            local arr = {};\n            for i = 1, len do\n                arr[i] = random(0, 255);\n            end\n            arr[pos] = n2;\n            return unpkg(arr);\n        end)};\n        if shouldErr then\n            valid = valid and arr[1] == false and arr[2] == msg;\n        else\n            valid = valid and arr[1];\n            acc1 = (acc1 + arr[pos + 1]) % 256;\n            acc2 = (acc2 + n2) % 256;\n        end\n    end\n    valid = valid and acc1 == acc2;\n\n    if valid then else\n        repeat\n            return (function()\n                while true do\n                    l1, l2 = l2, l1;\n                    err();\n                end\n            end)();\n        until true;\n        while true do\n            l2 = random(1, 6);\n            if l2 > 2 then\n                l2 = tostring(l1);\n            else\n                l1 = l2;\n            end\n        end\n        return;\n    end\nend\n\n    -- Anti Function Arg Hook\n    local obj = setmetatable({}, {\n        __tostring = err,\n    });\n    obj[math.random(1, 100)] = obj;\n    (function() end)(obj);\n\n    repeat until valid;\n    " local parsed=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}):parse(code) local doStat=parsed.body.statements[1] doStat.body.scope:setParent(ast.body.scope) table.insert(ast.body.statements,1,doStat) return ast end
-steps.AntiTamper = AntiTamper
-
--- SplitStrings
-local SplitStrings = Step:extend()
-SplitStrings.Name="Split Strings"
-SplitStrings.Description="This Step splits Strings to a specific or random length"
-SplitStrings.SettingsDescriptor={ Threshold={type="number",default=1,min=0,max=1}, MinLength={type="number",default=5,min=1}, MaxLength={type="number",default=5,min=1}, ConcatenationType={type="enum",values={"strcat","table","custom"},default="custom"}, CustomFunctionType={type="enum",values={"global","local","inline"},default="global"}, CustomLocalFunctionsCount={type="number",default=2,min=1} }
-local function generateTableConcatNode(chunks,data) local chunkNodes={} for _,chunk in ipairs(chunks) do table.insert(chunkNodes,Ast.TableEntry(Ast.StringExpression(chunk))) end local tb=Ast.TableConstructorExpression(chunkNodes) data.scope:addReferenceToHigherScope(data.tableConcatScope,data.tableConcatId) return Ast.FunctionCallExpression(Ast.VariableExpression(data.tableConcatScope,data.tableConcatId),{tb}) end
-local function generateStrCatNode(chunks) local node=nil for _,chunk in ipairs(chunks) do if node then node=Ast.StrCatExpression(node,Ast.StringExpression(chunk)) else node=Ast.StringExpression(chunk) end end return node end
-local custom1Code="function custom(table)\n    local stringTable, str = table[#table], \"\";\n    for i=1,#stringTable, 1 do\n        str = str .. stringTable[table[i]];\n\tend\n\treturn str\nend"
-local custom2Code="function custom(tb)\n\tlocal str = \"\";\n\tfor i=1, #tb / 2, 1 do\n\t\tstr = str .. tb[#tb / 2 + tb[i]];\n\tend\n\treturn str\nend"
-local function generateCustomNodeArgs(chunks,data,variant) local shuffled={} local shuffledIndices={} for i=1,#chunks do shuffledIndices[i]=i end util.shuffle(shuffledIndices) for i,v in ipairs(shuffledIndices) do shuffled[v]=chunks[i] end if variant==1 then local args={} local tbNodes={} for _,v in ipairs(shuffledIndices) do table.insert(args,Ast.TableEntry(Ast.NumberExpression(v))) end for _,chunk in ipairs(shuffled) do table.insert(tbNodes,Ast.TableEntry(Ast.StringExpression(chunk))) end local tb=Ast.TableConstructorExpression(tbNodes) table.insert(args,Ast.TableEntry(tb)) return {Ast.TableConstructorExpression(args)} else local args={} for _,v in ipairs(shuffledIndices) do table.insert(args,Ast.TableEntry(Ast.NumberExpression(v))) end for _,chunk in ipairs(shuffled) do table.insert(args,Ast.TableEntry(Ast.StringExpression(chunk))) end return {Ast.TableConstructorExpression(args)} end end
-local function generateCustomFunctionLiteral(parentScope,variant) local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local funcDeclNode if variant==1 then funcDeclNode=parser:parse(custom1Code).body.statements[1] else funcDeclNode=parser:parse(custom2Code).body.statements[1] end local funcBody=funcDeclNode.body local funcArgs=funcDeclNode.args funcBody.scope:setParent(parentScope) return Ast.FunctionLiteralExpression(funcArgs,funcBody) end
-local function generateGlobalCustomFunctionDeclaration(ast,data) local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local astScope=ast.body.scope local funcDeclNode if data.customFunctionVariant==1 then funcDeclNode=parser:parse(custom1Code).body.statements[1] else funcDeclNode=parser:parse(custom2Code).body.statements[1] end local funcBody=funcDeclNode.body local funcArgs=funcDeclNode.args funcBody.scope:setParent(astScope) return Ast.LocalVariableDeclaration(astScope,{data.customFuncId},{Ast.FunctionLiteralExpression(funcArgs,funcBody)}) end
-function SplitStrings:init() end
-function SplitStrings:variant() return math.random(1,2) end
-function SplitStrings:apply(ast,pipeline) local data={} if self.ConcatenationType=="table" then local scope=ast.body.scope local id=scope:addVariable() data.tableConcatScope=scope data.tableConcatId=id elseif self.ConcatenationType=="custom" then data.customFunctionType=self.CustomFunctionType if data.customFunctionType=="global" then local scope=ast.body.scope local id=scope:addVariable() data.customFuncScope=scope data.customFuncId=id data.customFunctionVariant=self:variant() end end local customLocalFunctionsCount=self.CustomLocalFunctionsCount local self2=self visitAst(ast,function(node,data) if self.ConcatenationType=="custom" and data.customFunctionType=="local" and node.kind==Ast.AstKind.Block and node.isFunctionBlock then data.functionData.localFunctions={} for i=1,customLocalFunctionsCount do local scope=data.scope local id=scope:addVariable() local variant=self:variant() table.insert(data.functionData.localFunctions,{scope=scope,id=id,variant=variant,used=false}) end end end,function(node,data) if self.ConcatenationType=="custom" and data.customFunctionType=="local" and node.kind==Ast.AstKind.Block and node.isFunctionBlock then for _,func in ipairs(data.functionData.localFunctions) do if func.used then local lit=generateCustomFunctionLiteral(func.scope,func.variant) table.insert(node.statements,1,Ast.LocalVariableDeclaration(func.scope,{func.id},{lit})) end end end if node.kind==Ast.AstKind.StringExpression then local str=node.value local chunks={} local i=1 while i<=#str do local len=math.random(self.MinLength,self.MaxLength) table.insert(chunks,str:sub(i,i+len-1)) i=i+len end if #chunks>1 and math.random()<self.Threshold then if self.ConcatenationType=="strcat" then node=generateStrCatNode(chunks) elseif self.ConcatenationType=="table" then node=generateTableConcatNode(chunks,data) elseif self.ConcatenationType=="custom" then if self.CustomFunctionType=="global" then local args=generateCustomNodeArgs(chunks,data,data.customFunctionVariant) data.scope:addReferenceToHigherScope(data.customFuncScope,data.customFuncId) node=Ast.FunctionCallExpression(Ast.VariableExpression(data.customFuncScope,data.customFuncId),args) elseif self.CustomFunctionType=="local" then local lfuncs=data.functionData.localFunctions local idx=math.random(#lfuncs) local func=lfuncs[idx] local args=generateCustomNodeArgs(chunks,data,func.variant) func.used=true data.scope:addReferenceToHigherScope(func.scope,func.id) node=Ast.FunctionCallExpression(Ast.VariableExpression(func.scope,func.id),args) elseif self.CustomFunctionType=="inline" then local variant=self:variant() local args=generateCustomNodeArgs(chunks,data,variant) local lit=generateCustomFunctionLiteral(data.scope,variant) node=Ast.FunctionCallExpression(lit,args) end end end return node,true end end end,data) if self.ConcatenationType=="table" then local globalScope=data.globalScope local tableScope,tableId=globalScope:resolve("table") ast.body.scope:addReferenceToHigherScope(globalScope,tableId) table.insert(ast.body.statements,1,Ast.LocalVariableDeclaration(data.tableConcatScope,{data.tableConcatId},{Ast.IndexExpression(Ast.VariableExpression(tableScope,tableId),Ast.StringExpression("concat"))})) elseif self.ConcatenationType=="custom" and self.CustomFunctionType=="global" then table.insert(ast.body.statements,1,generateGlobalCustomFunctionDeclaration(ast,data)) end end
-steps.SplitStrings = SplitStrings
-
--- WrapInFunction
-local WrapInFunction = Step:extend()
-WrapInFunction.Name="Wrap in Function"
-WrapInFunction.Description="This Step Wraps the Entire Script into a Function"
-WrapInFunction.SettingsDescriptor={ Iterations={type="number",default=1,min=1} }
-function WrapInFunction:init() end
-function WrapInFunction:apply(ast) for i=1,self.Iterations do local body=ast.body local scope=Scope:new(ast.globalScope) body.scope:setParent(scope) ast.body=Ast.Block({Ast.ReturnStatement({Ast.FunctionCallExpression(Ast.FunctionLiteralExpression({Ast.VarargExpression()},body),{Ast.VarargExpression()})})},scope) end end
-steps.WrapInFunction = WrapInFunction
-
--- Vmify (requires compiler)
-local Vmify = Step:extend()
-Vmify.Name="Vmify"
-Vmify.Description="This Step will Compile your script into a fully-custom Bytecode Format and emit a vm."
-Vmify.SettingsDescriptor={}
-function Vmify:init() end
-function Vmify:apply(ast) local Compiler=require("prometheus.compiler.compiler") local compiler=Compiler:new() return compiler:compile(ast) end
-steps.Vmify = Vmify
-
--- ConstantArray
-local ConstantArray = Step:extend()
-ConstantArray.Name="Constant Array"
-ConstantArray.Description="This Step will Extract all Constants and put them into an Array at the beginning of the script"
-ConstantArray.SettingsDescriptor={ Threshold={type="number",default=1,min=0,max=1}, StringsOnly={type="boolean",default=false}, Shuffle={type="boolean",default=true}, Rotate={type="boolean",default=true}, LocalWrapperThreshold={type="number",default=1,min=0,max=1}, LocalWrapperCount={type="number",default=0,min=0,max=512}, LocalWrapperArgCount={type="number",default=10,min=1,max=200}, MaxWrapperOffset={type="number",default=65535,min=0}, Encoding={type="enum",default="mixed",values={"none","base64","base85","mixed"}} }
-local prefix_0,prefix_1
-local function initPrefixes() local charset="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@£$%^&*()_+-=[]{}|:;<>,./?" repeat local a,b=math.random(#charset),math.random(#charset) prefix_0=charset:sub(a,a) prefix_1=charset:sub(b,b) until prefix_0~=prefix_1 end
-local function callNameGenerator(fn,...) if type(fn)=="table" then fn=fn.generateName end return fn(...) end
-function ConstantArray:init() end
-function ConstantArray:createArray() local entries={} for i,v in ipairs(self.constants) do if type(v)=="string" then v=self:encode(v) end entries[i]=Ast.TableEntry(Ast.ConstantNode(v)) end return Ast.TableConstructorExpression(entries) end
-function ConstantArray:indexing(index,data) if self.LocalWrapperCount>0 and data.functionData.local_wrappers then local wrappers=data.functionData.local_wrappers local wrapper=wrappers[math.random(#wrappers)] local args={} local ofs=index-self.wrapperOffset-wrapper.offset for i=1,self.LocalWrapperArgCount do if i==wrapper.arg then args[i]=Ast.NumberExpression(ofs) else args[i]=Ast.NumberExpression(math.random(ofs-1024,ofs+1024)) end end data.scope:addReferenceToHigherScope(wrappers.scope,wrappers.id) return Ast.FunctionCallExpression(Ast.IndexExpression(Ast.VariableExpression(wrappers.scope,wrappers.id),Ast.StringExpression(wrapper.index)),args) else data.scope:addReferenceToHigherScope(self.rootScope,self.wrapperId) return Ast.FunctionCallExpression(Ast.VariableExpression(self.rootScope,self.wrapperId),{Ast.NumberExpression(index-self.wrapperOffset)}) end end
-function ConstantArray:getConstant(value,data) if self.lookup[value] then return self:indexing(self.lookup[value],data) end local idx=#self.constants+1 self.constants[idx]=value self.lookup[value]=idx return self:indexing(idx,data) end
-function ConstantArray:addConstant(value) if self.lookup[value] then return end local idx=#self.constants+1 self.constants[idx]=value self.lookup[value]=idx end
-local function reverse(t,i,j) while i<j do t[i],t[j]=t[j],t[i] i,j=i+1,j-1 end end
-local function rotate(t,d,n) n=n or #t d=(d or 1)%n reverse(t,1,n) reverse(t,1,d) reverse(t,d+1,n) end
-local rotateCode="for i, v in ipairs({{1, LEN}, {1, SHIFT}, {SHIFT + 1, LEN}}) do while v[1] < v[2] do ARR[v[1]], ARR[v[2]], v[1], v[2] = ARR[v[2]], ARR[v[1]], v[1] + 1, v[2] - 1 end end"
-function ConstantArray:addRotateCode(ast,shift) local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local newAst=parser:parse(string.gsub(string.gsub(rotateCode,"SHIFT",shift),"LEN",#self.constants)) local forStat=newAst.body.statements[1] forStat.body.scope:setParent(ast.body.scope) visitast(newAst,nil,function(node,data) if node.kind==Ast.AstKind.VariableExpression then if node.scope:getVariableName(node.id)=="ARR" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(self.rootScope,self.arrId) node.scope=self.rootScope node.id=self.arrId end end end) table.insert(ast.body.statements,1,forStat) end
-function ConstantArray:addDecodeCode(ast) if self.Encoding=="base64" then local base64DecodeCode="do "..table.concat(util.shuffle{"local lookup=LOOKUP_TABLE;","local len=string.len;","local sub=string.sub;","local floor=math.floor;","local strchar=string.char;","local insert=table.insert;","local concat=table.concat;","local type=type;","local arr=ARR;"}).."\n for i=1,#arr do local data=arr[i] if type(data)==\"string\" then local length=len(data) local parts={} local index=1 local value=0 local count=0 while index<=length do local char=sub(data,index,index) local code=lookup[char] if code then value=value+code*(64^(3-count)) count=count+1 if count==4 then count=0 local c1=floor(value/65536) local c2=floor(value%65536/256) local c3=value%256 insert(parts,strchar(c1,c2,c3)) value=0 end elseif char==\"=\" then insert(parts,strchar(floor(value/65536))) if index>=length or sub(data,index+1,index+1)~=\"=\" then insert(parts,strchar(floor(value%65536/256))) end break end index=index+1 end arr[i]=concat(parts) end end end" local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local newAst=parser:parse(base64DecodeCode) local forStat=newAst.body.statements[1] forStat.body.scope:setParent(ast.body.scope) visitast(newAst,nil,function(node,data) if node.kind==Ast.AstKind.VariableExpression then if node.scope:getVariableName(node.id)=="ARR" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(self.rootScope,self.arrId) node.scope=self.rootScope node.id=self.arrId end if node.scope:getVariableName(node.id)=="LOOKUP_TABLE" then data.scope:removeReferenceToHigherScope(node.scope,node.id) return self:createBase64Lookup() end end end) table.insert(ast.body.statements,1,forStat) elseif self.Encoding=="base85" then local base85DecodeCode="do "..table.concat(util.shuffle{"local lookup=LOOKUP_TABLE;","local len=string.len;","local sub=string.sub;","local floor=math.floor;","local strchar=string.char;","local insert=table.insert;","local concat=table.concat;","local type=type;","local arr=ARR;"}).."\n for i=1,#arr do local data=arr[i] if type(data)==\"string\" then local length=len(data) local parts={} local index=1 while index<=length do local remain=length-index+1 local count=remain>=5 and 5 or remain local value=0 local valid=count>1 for j=0,4 do local code if j<count then local ch=sub(data,index+j,index+j) code=lookup[ch] if not code then valid=false break end else code=84 end value=value*85+code end if valid then local b1=floor(value/16777216)%256 local b2=floor(value/65536)%256 local b3=floor(value/256)%256 local b4=value%256 if count==5 then insert(parts,strchar(b1,b2,b3,b4)) elseif count==4 then insert(parts,strchar(b1,b2,b3)) elseif count==3 then insert(parts,strchar(b1,b2)) elseif count==2 then insert(parts,strchar(b1)) end end index=index+count end arr[i]=concat(parts) end end end" local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local newAst=parser:parse(base85DecodeCode) local forStat=newAst.body.statements[1] forStat.body.scope:setParent(ast.body.scope) visitast(newAst,nil,function(node,data) if node.kind==Ast.AstKind.VariableExpression then if node.scope:getVariableName(node.id)=="ARR" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(self.rootScope,self.arrId) node.scope=self.rootScope node.id=self.arrId end if node.scope:getVariableName(node.id)=="LOOKUP_TABLE" then data.scope:removeReferenceToHigherScope(node.scope,node.id) return self:createBase85Lookup() end end end) table.insert(ast.body.statements,1,forStat) elseif self.Encoding=="mixed" then local mixedDecodeCode="do "..table.concat(util.shuffle{"local lookup64=LOOKUP_TABLE_64;","local lookup85=LOOKUP_TABLE_85;","local len=string.len;","local sub=string.sub;","local floor=math.floor;","local strchar=string.char;","local insert=table.insert;","local concat=table.concat;","local type=type;","local arr=ARR;"}).."\n for i=1,#arr do local data=arr[i] if type(data)==\"string\" then local first=sub(data,1,1) if first==\""..prefix_0.."\" then data=sub(data,2) local length=len(data) local parts={} local index=1 local value=0 local count=0 while index<=length do local char=sub(data,index,index) local code=lookup64[char] if code then value=value+code*(64^(3-count)) count=count+1 if count==4 then count=0 local c1=floor(value/65536) local c2=floor(value%65536/256) local c3=value%256 insert(parts,strchar(c1,c2,c3)) value=0 end elseif char==\"=\" then insert(parts,strchar(floor(value/65536))) if index>=length or sub(data,index+1,index+1)~=\"=\" then insert(parts,strchar(floor(value%65536/256))) end break end index=index+1 end arr[i]=concat(parts) elseif first==\""..prefix_1.."\" then data=sub(data,2) local length=len(data) local parts={} local idx=1 while idx<=length do local remain=length-idx+1 local count=remain>=5 and 5 or remain local value=0 local valid=count>1 for j=0,4 do local code if j<count then local ch=sub(data,idx+j,idx+j) code=lookup85[ch] if not code then valid=false break end else code=84 end value=value*85+code end if valid then local b1=floor(value/16777216)%256 local b2=floor(value/65536)%256 local b3=floor(value/256)%256 local b4=value%256 if count==5 then insert(parts,strchar(b1,b2,b3,b4)) elseif count==4 then insert(parts,strchar(b1,b2,b3)) elseif count==3 then insert(parts,strchar(b1,b2)) elseif count==2 then insert(parts,strchar(b1)) end end idx=idx+count end arr[i]=concat(parts) end end end end" local parser=Parser:new({LuaVersion=Enums.LuaVersion.Lua51}) local newAst=parser:parse(mixedDecodeCode) local forStat=newAst.body.statements[1] forStat.body.scope:setParent(ast.body.scope) visitast(newAst,nil,function(node,data) if node.kind==Ast.AstKind.VariableExpression then if node.scope:getVariableName(node.id)=="ARR" then data.scope:removeReferenceToHigherScope(node.scope,node.id) data.scope:addReferenceToHigherScope(self.rootScope,self.arrId) node.scope=self.rootScope node.id=self.arrId end if node.scope:getVariableName(node.id)=="LOOKUP_TABLE_64" then data.scope:removeReferenceToHigherScope(node.scope,node.id) return self:createBase64Lookup() end if node.scope:getVariableName(node.id)=="LOOKUP_TABLE_85" then data.scope:removeReferenceToHigherScope(node.scope,node.id) return self:createBase85Lookup() end end end) table.insert(ast.body.statements,1,forStat) end end
-function ConstantArray:createBase64Lookup() local entries={} local i=0 for char in self.base64chars:gmatch(".") do table.insert(entries,Ast.KeyedTableEntry(Ast.StringExpression(char),Ast.NumberExpression(i))) i=i+1 end util.shuffle(entries) return Ast.TableConstructorExpression(entries) end
-function ConstantArray:createBase85Lookup() local entries={} local i=0 for char in self.base85chars:gmatch(".") do table.insert(entries,Ast.KeyedTableEntry(Ast.StringExpression(char),Ast.NumberExpression(i))) i=i+1 end util.shuffle(entries) return Ast.TableConstructorExpression(entries) end
-function ConstantArray:encode(str) if self.Encoding=="base64" then return ((str:gsub('.',function(x) local r,b='',x:byte() for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end return r end)..'0000'):gsub('%d%d%d?%d?%d?%d?',function(x) if #x<6 then return '' end local c=0 for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end return self.base64chars:sub(c+1,c+1) end)..({ '', '==', '=' })[#str%3+1]) elseif self.Encoding=="base85" then local result={} local len=#str local pos=1 while pos<=len do local rem=len-pos+1 local count=rem>=4 and 4 or rem local b1,b2,b3,b4=string.byte(str,pos,pos+count-1) b1,b2,b3,b4=b1 or 0,b2 or 0,b3 or 0,b4 or 0 local value=((b1*256+b2)*256+b3)*256+b4 local chars={} for i=5,1,-1 do local code=(value%85)+1 chars[i]=self.base85chars:sub(code,code) value=math.floor(value/85) end result[#result+1]=table.concat(chars,"",1,count+1) pos=pos+count end return table.concat(result) elseif self.Encoding=="mixed" then if math.random()<0.5 then local encoded=((str:gsub('.',function(x) local r,b='',x:byte() for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end return r end)..'0000'):gsub('%d%d%d?%d?%d?%d?',function(x) if #x<6 then return '' end local c=0 for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end return self.base64chars:sub(c+1,c+1) end)..({ '', '==', '=' })[#str%3+1]) return prefix_0..encoded else local result={} local len=#str local pos=1 while pos<=len do local rem=len-pos+1 local count=rem>=4 and 4 or rem local b1,b2,b3,b4=string.byte(str,pos,pos+count-1) b1,b2,b3,b4=b1 or 0,b2 or 0,b3 or 0,b4 or 0 local value=((b1*256+b2)*256+b3)*256+b4 local chars={} for i=5,1,-1 do local code=(value%85)+1 chars[i]=self.base85chars:sub(code,code) value=math.floor(value/85) end result[#result+1]=table.concat(chars,"",1,count+1) pos=pos+count end return prefix_1..table.concat(result) end end
-function ConstantArray:apply(ast,pipeline) initPrefixes() self.rootScope=ast.body.scope self.arrId=self.rootScope:addVariable() self.base64chars=table.concat(util.shuffle{"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","0","1","2","3","4","5","6","7","8","9","+","/"}) self.base85chars=table.concat(util.shuffle{"!","\"","#","$","%","&","'","(",")","*","+",",","-",".","/","0","1","2","3","4","5","6","7","8","9",":",";","<","=",">","?","@","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","[","\\\\","]","^","_","`","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u"}) self.constants={} self.lookup={} visitast(ast,nil,function(node,data) if math.random()<=self.Threshold then node.__apply_constant_array=true if node.kind==Ast.AstKind.StringExpression then self:addConstant(node.value) elseif not self.StringsOnly then if node.isConstant and node.value~=nil then self:addConstant(node.value) end end end end) if self.Shuffle then self.constants=util.shuffle(self.constants) self.lookup={} for i,v in ipairs(self.constants) do self.lookup[v]=i end end self.wrapperOffset=math.random(-self.MaxWrapperOffset,self.MaxWrapperOffset) self.wrapperId=self.rootScope:addVariable() visitAst(ast,function(node,data) if self.LocalWrapperCount>0 and node.kind==Ast.AstKind.Block and node.isFunctionBlock and math.random()<=self.LocalWrapperThreshold then local id=node.scope:addVariable() data.functionData.local_wrappers={id=id,scope=node.scope} local nameLookup={} for i=1,self.LocalWrapperCount do local name repeat name=callNameGenerator(pipeline.namegenerator,math.random(1,self.LocalWrapperArgCount*16)) until not nameLookup[name] nameLookup[name]=true local offset=math.random(-self.MaxWrapperOffset,self.MaxWrapperOffset) local argPos=math.random(1,self.LocalWrapperArgCount) data.functionData.local_wrappers[i]={arg=argPos,index=name,offset=offset} data.functionData.__used=false end end if node.__apply_constant_array then data.functionData.__used=true end end,function(node,data) if node.__apply_constant_array then if node.kind==Ast.AstKind.StringExpression then return self:getConstant(node.value,data) elseif not self.StringsOnly then if node.isConstant and node.value~=nil then return self:getConstant(node.value,data) end end node.__apply_constant_array=nil end if self.LocalWrapperCount>0 and node.kind==Ast.AstKind.Block and node.isFunctionBlock and data.functionData.local_wrappers and data.functionData.__used then data.functionData.__used=nil local elems={} local wrappers=data.functionData.local_wrappers for i=1,self.LocalWrapperCount do local wrapper=wrappers[i] local argPos=wrapper.arg local offset=wrapper.offset local name=wrapper.index local funcScope=Scope:new(node.scope) local arg=nil local args={} for i=1,self.LocalWrapperArgCount do args[i]=funcScope:addVariable() if i==argPos then arg=args[i] end end local addSubArg if offset<0 then addSubArg=Ast.SubExpression(Ast.VariableExpression(funcScope,arg),Ast.NumberExpression(-offset)) else addSubArg=Ast.AddExpression(Ast.VariableExpression(funcScope,arg),Ast.NumberExpression(offset)) end funcScope:addReferenceToHigherScope(self.rootScope,self.wrapperId) local callArg=Ast.FunctionCallExpression(Ast.VariableExpression(self.rootScope,self.wrapperId),{addSubArg}) local fargs={} for _,v in ipairs(args) do fargs[#fargs+1]=Ast.VariableExpression(funcScope,v) end elems[i]=Ast.KeyedTableEntry(Ast.StringExpression(name),Ast.FunctionLiteralExpression(fargs,Ast.Block({Ast.ReturnStatement({callArg})},funcScope))) end table.insert(node.statements,1,Ast.LocalVariableDeclaration(node.scope,{wrappers.id},{Ast.TableConstructorExpression(elems)})) end end) self:addDecodeCode(ast) local steps=util.shuffle({function() local funcScope=Scope:new(self.rootScope) funcScope:addReferenceToHigherScope(self.rootScope,self.arrId) local arg=funcScope:addVariable() local addSubArg if self.wrapperOffset<0 then addSubArg=Ast.SubExpression(Ast.VariableExpression(funcScope,arg),Ast.NumberExpression(-self.wrapperOffset)) else addSubArg=Ast.AddExpression(Ast.VariableExpression(funcScope,arg),Ast.NumberExpression(self.wrapperOffset)) end table.insert(ast.body.statements,1,Ast.LocalFunctionDeclaration(self.rootScope,self.wrapperId,{Ast.VariableExpression(funcScope,arg)},Ast.Block({Ast.ReturnStatement({Ast.IndexExpression(Ast.VariableExpression(self.rootScope,self.arrId),addSubArg)})},funcScope))) end,function() if self.Rotate and #self.constants>1 then local shift=math.random(1,#self.constants-1) rotate(self.constants,-shift) self:addRotateCode(ast,shift) end end}) for _,f in ipairs(steps) do f() end table.insert(ast.body.statements,1,Ast.LocalVariableDeclaration(self.rootScope,{self.arrId},{self:createArray()})) self.rootScope=nil self.arrId=nil self.constants=nil self.lookup=nil end
-steps.ConstantArray = ConstantArray
-
--- WatermarkCheck
-local WatermarkCheck = Step:extend()
-WatermarkCheck.Name="WatermarkCheck"
-WatermarkCheck.Description="This Step will add a watermark to the script"
-WatermarkCheck.SettingsDescriptor={ Content={type="string",default="This Script is Part of the Prometheus Obfuscator by trieu1082"} }
-local function callNameGenerator(fn,...) if type(fn)=="table" then fn=fn.generateName end return fn(...) end
-function WatermarkCheck:init() end
-function WatermarkCheck:apply(ast,pipeline) self.CustomVariable="_"..callNameGenerator(pipeline.namegenerator,math.random(10000000000,100000000000)) pipeline:addStep(Watermark:new(self)) local body=ast.body local wmExpr=Ast.StringExpression(self.Content) local scope,var=ast.globalScope:resolve(self.CustomVariable) local wm=Ast.VariableExpression(ast.globalScope,var) local notEq=Ast.NotEqualsExpression(wm,wmExpr) local ifBody=Ast.Block({Ast.ReturnStatement({})},Scope:new(ast.body.scope)) table.insert(body.statements,1,Ast.IfStatement(notEq,ifBody,{},nil)) end
-steps.WatermarkCheck = WatermarkCheck
-
-_MODULES["prometheus.steps"] = function() return steps end
-end
-
--- compiler (all compiler modules)
-do
-local compiler = {}
-local constants = { MAX_REGS=100, MAX_REGS_MUL=0 }
-_MODULES["prometheus.compiler.constants"] = function() return constants end
-
--- compiler/block
-do
-local Scope = require("prometheus.scope")
-local util = require("prometheus.util")
-local lookupify = util.lookupify
-return function(Compiler)
-  function Compiler:createBlock() local id repeat id=math.random(0,2^24) until not self.usedBlockIds[id] self.usedBlockIds[id]=true local scope=Scope:new(self.containerFuncScope) local block={id=id,statements={},scope=scope,advanceToNextBlock=true} table.insert(self.blocks,block) return block end
-  function Compiler:setActiveBlock(block) self.activeBlock=block end
-  function Compiler:addStatement(statement,writes,reads,usesUpvals) if self.activeBlock.advanceToNextBlock then table.insert(self.activeBlock.statements,{statement=statement,writes=lookupify(writes),reads=lookupify(reads),usesUpvals=usesUpvals or false}) end end
-end
-_MODULES["prometheus.compiler.block"] = function() return require("prometheus.compiler.block") end
-
--- compiler/register
-do
-local Ast = require("prometheus.ast")
-local constants = require("prometheus.compiler.constants")
-local randomStrings = require("prometheus.randomStrings")
-local MAX_REGS = constants.MAX_REGS
-return function(Compiler)
-  function Compiler:freeRegister(id,force) if force or not (self.registers[id]==self.VAR_REGISTER) then self.usedRegisters=self.usedRegisters-1 self.registers[id]=false end end
-  function Compiler:isVarRegister(id) return self.registers[id]==self.VAR_REGISTER end
-  function Compiler:allocRegister(isVar) self.usedRegisters=self.usedRegisters+1 if not isVar then if not self.registers[self.POS_REGISTER] then self.registers[self.POS_REGISTER]=true return self.POS_REGISTER end if not self.registers[self.RETURN_REGISTER] then self.registers[self.RETURN_REGISTER]=true return self.RETURN_REGISTER end end local id=0 if self.usedRegisters<MAX_REGS*constants.MAX_REGS_MUL then repeat id=math.random(1,MAX_REGS-1) until not self.registers[id] else repeat id=id+1 until not self.registers[id] end if id>self.maxUsedRegister then self.maxUsedRegister=id end if isVar then self.registers[id]=self.VAR_REGISTER else self.registers[id]=true end return id end
-  function Compiler:isUpvalue(scope,id) return self.upvalVars[scope] and self.upvalVars[scope][id] end
-  function Compiler:makeUpvalue(scope,id) if not self.upvalVars[scope] then self.upvalVars[scope]={} end self.upvalVars[scope][id]=true end
-  function Compiler:getVarRegister(scope,id,functionDepth,potentialId) if not self.registersForVar[scope] then self.registersForVar[scope]={} self.scopeFunctionDepths[scope]=functionDepth end local reg=self.registersForVar[scope][id] if not reg then if potentialId and self.registers[potentialId]~=self.VAR_REGISTER and potentialId~=self.POS_REGISTER and potentialId~=self.RETURN_REGISTER then self.registers[potentialId]=self.VAR_REGISTER reg=potentialId else reg=self:allocRegister(true) end self.registersForVar[scope][id]=reg end return reg end
-  function Compiler:getRegisterVarId(id) local varId=self.registerVars[id] if not varId then varId=self.containerFuncScope:addVariable() self.registerVars[id]=varId end return varId end
-  function Compiler:register(scope,id) if id==self.POS_REGISTER then return self:pos(scope) end if id==self.RETURN_REGISTER then return self:getReturn(scope) end if id<MAX_REGS then local vid=self:getRegisterVarId(id) scope:addReferenceToHigherScope(self.containerFuncScope,vid) return Ast.VariableExpression(self.containerFuncScope,vid) end local vid=self:getRegisterVarId(MAX_REGS) scope:addReferenceToHigherScope(self.containerFuncScope,vid) return Ast.IndexExpression(Ast.VariableExpression(self.containerFuncScope,vid),Ast.NumberExpression((id-MAX_REGS)+1)) end
-  function Compiler:registerList(scope,ids) local l={} for _,id in ipairs(ids) do table.insert(l,self:register(scope,id)) end return l end
-  function Compiler:registerAssignment(scope,id) if id==self.POS_REGISTER then return self:posAssignment(scope) end if id==self.RETURN_REGISTER then return self:returnAssignment(scope) end if id<MAX_REGS then local vid=self:getRegisterVarId(id) scope:addReferenceToHigherScope(self.containerFuncScope,vid) return Ast.AssignmentVariable(self.containerFuncScope,vid) end local vid=self:getRegisterVarId(MAX_REGS) scope:addReferenceToHigherScope(self.containerFuncScope,vid) return Ast.AssignmentIndexing(Ast.VariableExpression(self.containerFuncScope,vid),Ast.NumberExpression((id-MAX_REGS)+1)) end
-  function Compiler:setRegister(scope,id,val,compundArg) if compundArg then return compundArg(self:registerAssignment(scope,id),val) end return Ast.AssignmentStatement({self:registerAssignment(scope,id)},{val}) end
-  function Compiler:setRegisters(scope,ids,vals) local idStats={} for _,id in ipairs(ids) do table.insert(idStats,self:registerAssignment(scope,id)) end return Ast.AssignmentStatement(idStats,vals) end
-  function Compiler:copyRegisters(scope,to,from) local idStats={} local vals={} for i,id in ipairs(to) do local fromId=from[i] if fromId~=id then table.insert(idStats,self:registerAssignment(scope,id)) table.insert(vals,self:register(scope,fromId)) end end if #idStats>0 and #vals>0 then return Ast.AssignmentStatement(idStats,vals) end end
-  function Compiler:resetRegisters() self.registers={} end
-  function Compiler:pos(scope) scope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) return Ast.VariableExpression(self.containerFuncScope,self.posVar) end
-  function Compiler:posAssignment(scope) scope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) return Ast.AssignmentVariable(self.containerFuncScope,self.posVar) end
-  function Compiler:args(scope) scope:addReferenceToHigherScope(self.containerFuncScope,self.argsVar) return Ast.VariableExpression(self.containerFuncScope,self.argsVar) end
-  function Compiler:unpack(scope) scope:addReferenceToHigherScope(self.scope,self.unpackVar) return Ast.VariableExpression(self.scope,self.unpackVar) end
-  function Compiler:env(scope) scope:addReferenceToHigherScope(self.scope,self.envVar) return Ast.VariableExpression(self.scope,self.envVar) end
-  function Compiler:jmp(scope,to) scope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) return Ast.AssignmentStatement({Ast.AssignmentVariable(self.containerFuncScope,self.posVar)},{to}) end
-  function Compiler:setPos(scope,val) if not val then local v=Ast.IndexExpression(self:env(scope),randomStrings.randomStringNode(math.random(12,14))) scope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) return Ast.AssignmentStatement({Ast.AssignmentVariable(self.containerFuncScope,self.posVar)},{v}) end scope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) return Ast.AssignmentStatement({Ast.AssignmentVariable(self.containerFuncScope,self.posVar)},{Ast.NumberExpression(val) or Ast.NilExpression()}) end
-  function Compiler:setReturn(scope,val) scope:addReferenceToHigherScope(self.containerFuncScope,self.returnVar) return Ast.AssignmentStatement({Ast.AssignmentVariable(self.containerFuncScope,self.returnVar)},{val}) end
-  function Compiler:getReturn(scope) scope:addReferenceToHigherScope(self.containerFuncScope,self.returnVar) return Ast.VariableExpression(self.containerFuncScope,self.returnVar) end
-  function Compiler:returnAssignment(scope) scope:addReferenceToHigherScope(self.containerFuncScope,self.returnVar) return Ast.AssignmentVariable(self.containerFuncScope,self.returnVar) end
-  function Compiler:setUpvalueMember(scope,idExpr,valExpr,compoundConstructor) scope:addReferenceToHigherScope(self.scope,self.upvaluesTable) if compoundConstructor then return compoundConstructor(Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesTable),idExpr),valExpr) end return Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesTable),idExpr)},{valExpr}) end
-  function Compiler:getUpvalueMember(scope,idExpr) scope:addReferenceToHigherScope(self.scope,self.upvaluesTable) return Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesTable),idExpr) end
-end
-_MODULES["prometheus.compiler.register"] = function() return require("prometheus.compiler.register") end
-
--- compiler/upvalue
-do
-local Ast = require("prometheus.ast")
-local Scope = require("prometheus.scope")
-local util = require("prometheus.util")
-local unpack = unpack or table.unpack
-return function(Compiler)
-  function Compiler:createUpvaluesGcFunc() local scope=Scope:new(self.scope) local selfVar=scope:addVariable() local iteratorVar=scope:addVariable() local valueVar=scope:addVariable() local whileScope=Scope:new(scope) whileScope:addReferenceToHigherScope(self.scope,self.upvaluesReferenceCountsTable,3) whileScope:addReferenceToHigherScope(scope,valueVar,3) whileScope:addReferenceToHigherScope(scope,iteratorVar,3) local ifScope=Scope:new(whileScope) ifScope:addReferenceToHigherScope(self.scope,self.upvaluesReferenceCountsTable,1) ifScope:addReferenceToHigherScope(self.scope,self.upvaluesTable,1) return Ast.FunctionLiteralExpression({Ast.VariableExpression(scope,selfVar)},Ast.Block({Ast.LocalVariableDeclaration(scope,{iteratorVar,valueVar},{Ast.NumberExpression(1),Ast.IndexExpression(Ast.VariableExpression(scope,selfVar),Ast.NumberExpression(1))}),Ast.WhileStatement(Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,valueVar)),Ast.AssignmentVariable(scope,iteratorVar)},{Ast.SubExpression(Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,valueVar)),Ast.NumberExpression(1)),Ast.AddExpression(unpack(util.shuffle{Ast.VariableExpression(scope,iteratorVar),Ast.NumberExpression(1)}))}),Ast.IfStatement(Ast.EqualsExpression(unpack(util.shuffle{Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,valueVar)),Ast.NumberExpression(0)})),Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,valueVar)),Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesTable),Ast.VariableExpression(scope,valueVar))},{Ast.NilExpression(),Ast.NilExpression()})},ifScope),{},nil),Ast.AssignmentStatement({Ast.AssignmentVariable(scope,valueVar)},{Ast.IndexExpression(Ast.VariableExpression(scope,selfVar),Ast.VariableExpression(scope,iteratorVar))})},whileScope),Ast.VariableExpression(scope,valueVar),scope)})) end
-  function Compiler:createFreeUpvalueFunc() local scope=Scope:new(self.scope) local argVar=scope:addVariable() local ifScope=Scope:new(scope) ifScope:addReferenceToHigherScope(scope,argVar,3) scope:addReferenceToHigherScope(self.scope,self.upvaluesReferenceCountsTable,2) return Ast.FunctionLiteralExpression({Ast.VariableExpression(scope,argVar)},Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,argVar))},{Ast.SubExpression(Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,argVar)),Ast.NumberExpression(1))}),Ast.IfStatement(Ast.EqualsExpression(unpack(util.shuffle{Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,argVar)),Ast.NumberExpression(0)})),Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(scope,argVar)),Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesTable),Ast.VariableExpression(scope,argVar))},{Ast.NilExpression(),Ast.NilExpression()})},ifScope),{},nil)})) end
-  function Compiler:createUpvaluesProxyFunc() local scope=Scope:new(self.scope) scope:addReferenceToHigherScope(self.scope,self.newproxyVar) local entriesVar=scope:addVariable() local ifScope=Scope:new(scope) local proxyVar=ifScope:addVariable() local metatableVar=ifScope:addVariable() local elseScope=Scope:new(scope) ifScope:addReferenceToHigherScope(self.scope,self.newproxyVar) ifScope:addReferenceToHigherScope(self.scope,self.getmetatableVar) ifScope:addReferenceToHigherScope(self.scope,self.upvaluesGcFunctionVar) ifScope:addReferenceToHigherScope(scope,entriesVar) elseScope:addReferenceToHigherScope(self.scope,self.setmetatableVar) elseScope:addReferenceToHigherScope(scope,entriesVar) elseScope:addReferenceToHigherScope(self.scope,self.upvaluesGcFunctionVar) local forScope=Scope:new(scope) local forArg=forScope:addVariable() forScope:addReferenceToHigherScope(self.scope,self.upvaluesReferenceCountsTable,2) forScope:addReferenceToHigherScope(scope,entriesVar,2) return Ast.FunctionLiteralExpression({Ast.VariableExpression(scope,entriesVar)},Ast.Block({Ast.ForStatement(forScope,forArg,Ast.NumberExpression(1),Ast.LenExpression(Ast.VariableExpression(scope,entriesVar)),Ast.NumberExpression(1),Ast.Block({Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.IndexExpression(Ast.VariableExpression(scope,entriesVar),Ast.VariableExpression(forScope,forArg)))},{Ast.AddExpression(unpack(util.shuffle{Ast.IndexExpression(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.IndexExpression(Ast.VariableExpression(scope,entriesVar),Ast.VariableExpression(forScope,forArg))),Ast.NumberExpression(1)}))})},forScope),scope),Ast.IfStatement(Ast.VariableExpression(self.scope,self.newproxyVar),Ast.Block({Ast.LocalVariableDeclaration(ifScope,{proxyVar},{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.newproxyVar),{Ast.BooleanExpression(true)})}),Ast.LocalVariableDeclaration(ifScope,{metatableVar},{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.getmetatableVar),{Ast.VariableExpression(ifScope,proxyVar)})}),Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(ifScope,metatableVar),Ast.StringExpression("__index")),Ast.AssignmentIndexing(Ast.VariableExpression(ifScope,metatableVar),Ast.StringExpression("__gc")),Ast.AssignmentIndexing(Ast.VariableExpression(ifScope,metatableVar),Ast.StringExpression("__len"))},{Ast.VariableExpression(scope,entriesVar),Ast.VariableExpression(self.scope,self.upvaluesGcFunctionVar),Ast.FunctionLiteralExpression({},Ast.Block({Ast.ReturnStatement({Ast.NumberExpression(self.upvalsProxyLenReturn)})},Scope:new(ifScope)))}),Ast.ReturnStatement({Ast.VariableExpression(ifScope,proxyVar)})},ifScope),{},Ast.Block({Ast.ReturnStatement({Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.setmetatableVar),{Ast.TableConstructorExpression({}),Ast.TableConstructorExpression({Ast.KeyedTableEntry(Ast.StringExpression("__gc"),Ast.VariableExpression(self.scope,self.upvaluesGcFunctionVar)),Ast.KeyedTableEntry(Ast.StringExpression("__index"),Ast.VariableExpression(scope,entriesVar)),Ast.KeyedTableEntry(Ast.StringExpression("__len"),Ast.FunctionLiteralExpression({},Ast.Block({Ast.ReturnStatement({Ast.NumberExpression(self.upvalsProxyLenReturn)})},Scope:new(ifScope))))})})})},elseScope)})) end
-  function Compiler:createAllocUpvalFunction() local scope=Scope:new(self.scope) scope:addReferenceToHigherScope(self.scope,self.currentUpvalId,4) scope:addReferenceToHigherScope(self.scope,self.upvaluesReferenceCountsTable,1) return Ast.FunctionLiteralExpression({},Ast.Block({Ast.AssignmentStatement({Ast.AssignmentVariable(self.scope,self.currentUpvalId)},{Ast.AddExpression(unpack(util.shuffle({Ast.VariableExpression(self.scope,self.currentUpvalId),Ast.NumberExpression(1)})))}),Ast.AssignmentStatement({Ast.AssignmentIndexing(Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(self.scope,self.currentUpvalId))},{Ast.NumberExpression(1)}),Ast.ReturnStatement({Ast.VariableExpression(self.scope,self.currentUpvalId)})},scope)) end
-end
-_MODULES["prometheus.compiler.upvalue"] = function() return require("prometheus.compiler.upvalue") end
-
--- compiler/emit
-do
-local Ast = require("prometheus.ast")
-local Scope = require("prometheus.scope")
-local util = require("prometheus.util")
-local constants = require("prometheus.compiler.constants")
 local AstKind = Ast.AstKind
-local MAX_REGS = constants.MAX_REGS
-return function(Compiler)
-  local function hasAnyEntries(tbl) return type(tbl)=="table" and next(tbl)~=nil end
-  local function unionLookupTables(a,b) local out={} for k,v in pairs(a or {}) do out[k]=v end for k,v in pairs(b or {}) do out[k]=v end return out end
-  local function canMergeParallelAssignmentStatements(statA,statB) if type(statA)~="table" or type(statB)~="table" then return false end if statA.usesUpvals or statB.usesUpvals then return false end local a=statA.statement local b=statB.statement if type(a)~="table" or type(b)~="table" then return false end if a.kind~=AstKind.AssignmentStatement or b.kind~=AstKind.AssignmentStatement then return false end if type(a.lhs)~="table" or type(a.rhs)~="table" or type(b.lhs)~="table" or type(b.rhs)~="table" then return false end if #a.lhs~=#a.rhs or #b.lhs~=#b.rhs then return false end local function hasUnsafeRhs(rhsList) for _,rhsExpr in ipairs(rhsList) do if type(rhsExpr)~="table" then return true end local kind=rhsExpr.kind if kind==AstKind.FunctionCallExpression or kind==AstKind.PassSelfFunctionCallExpression or kind==AstKind.VarargExpression then return true end end return false end if hasUnsafeRhs(a.rhs) or hasUnsafeRhs(b.rhs) then return false end local aReads=type(statA.reads)=="table" and statA.reads or {} local aWrites=type(statA.writes)=="table" and statA.writes or {} local bReads=type(statB.reads)=="table" and statB.reads or {} local bWrites=type(statB.writes)=="table" and statB.writes or {} if not hasAnyEntries(aWrites) and not hasAnyEntries(bWrites) then return false end for r in pairs(aReads) do if bWrites[r] then return false end end for r in pairs(aWrites) do if bWrites[r] or bReads[r] then return false end end return true end
-  local function mergeParallelAssignmentStatements(statA,statB) local lhs={} local rhs={} local aLhs,bLhs=statA.statement.lhs,statB.statement.lhs local aRhs,bRhs=statA.statement.rhs,statB.statement.rhs for i=1,#aLhs do lhs[i]=aLhs[i] end for i=1,#bLhs do lhs[#aLhs+i]=bLhs[i] end for i=1,#aRhs do rhs[i]=aRhs[i] end for i=1,#bRhs do rhs[#aRhs+i]=bRhs[i] end return {statement=Ast.AssignmentStatement(lhs,rhs),writes=unionLookupTables(statA.writes,statB.writes),reads=unionLookupTables(statA.reads,statB.reads),usesUpvals=statA.usesUpvals or statB.usesUpvals} end
-  local function mergeAdjacentParallelAssignments(blockstats) local merged={} local i=1 while i<=#blockstats do local stat=blockstats[i] i=i+1 while i<=#blockstats and canMergeParallelAssignmentStatements(stat,blockstats[i]) do stat=mergeParallelAssignmentStatements(stat,blockstats[i]) i=i+1 end table.insert(merged,stat) end return merged end
-  function Compiler:emitContainerFuncBody() local blocks={} util.shuffle(self.blocks) for i,block in ipairs(self.blocks) do local id=block.id local blockstats=block.statements for i=2,#blockstats do local stat=blockstats[i] local reads=stat.reads local writes=stat.writes local maxShift=0 local usesUpvals=stat.usesUpvals for shift=1,i-1 do local stat2=blockstats[i-shift] if stat2.usesUpvals and usesUpvals then break end local reads2=stat2.reads local writes2=stat2.writes local f=true for r in pairs(reads2) do if writes[r] then f=false break end end if f then for r in pairs(writes2) do if writes[r] then f=false break end if reads[r] then f=false break end end end if not f then break end maxShift=shift end local shift=math.random(0,maxShift) for j=1,shift do blockstats[i-j],blockstats[i-j+1]=blockstats[i-j+1],blockstats[i-j] end end local mergedBlockStats=mergeAdjacentParallelAssignments(blockstats) for _=1,7 do mergedBlockStats=mergeAdjacentParallelAssignments(mergedBlockStats) end blockstats={} for _,stat in ipairs(mergedBlockStats) do table.insert(blockstats,stat.statement) end local block={id=id,index=i,block=Ast.Block(blockstats,block.scope)} table.insert(blocks,block) blocks[id]=block end table.sort(blocks,function(a,b) return a.id<b.id end) local function buildBlockThresholdCondition(scope,leftId,rightId,useAndOr) local bound=math.floor((leftId+rightId)/2) local posExpr=self:pos(scope) local boundExpr=Ast.NumberExpression(bound) if useAndOr then return Ast.LessThanExpression(posExpr,boundExpr) else local variant=math.random(1,2) if variant==1 then return Ast.LessThanExpression(posExpr,boundExpr) else return Ast.GreaterThanExpression(boundExpr,posExpr) end end end
-  local function buildElseifChain(tb,l,r,pScope) if r<l then local emptyScope=Scope:new(pScope) return Ast.Block({},emptyScope) end local len=r-l+1 if len==1 then tb[l].block.scope:setParent(pScope) return tb[l].block end if len<=4 then local ifScope=Scope:new(pScope) local elseifs={} tb[l].block.scope:setParent(ifScope) local firstCondition=buildBlockThresholdCondition(ifScope,tb[l].id,tb[l+1].id,false) local firstBlock=tb[l].block for i=l+1,r-1 do tb[i].block.scope:setParent(ifScope) local condition=buildBlockThresholdCondition(ifScope,tb[i].id,tb[i+1].id,false) table.insert(elseifs,{condition=condition,body=tb[i].block}) end tb[r].block.scope:setParent(ifScope) local elseBlock=tb[r].block return Ast.Block({Ast.IfStatement(firstCondition,firstBlock,elseifs,elseBlock)},ifScope) end local mid=l+math.ceil(len/2) local leftMaxId=tb[mid-1].id local rightMinId=tb[mid].id local bound=math.floor((leftMaxId+rightMinId)/2) local ifScope=Scope:new(pScope) local lBlock=buildElseifChain(tb,l,mid-1,ifScope) local rBlock=buildElseifChain(tb,mid,r,ifScope) local condStyle=math.random(1,3) local condition local trueBlock,falseBlock if condStyle==1 then condition=Ast.LessThanExpression(self:pos(ifScope),Ast.NumberExpression(bound)) trueBlock,falseBlock=lBlock,rBlock elseif condStyle==2 then condition=Ast.GreaterThanExpression(Ast.NumberExpression(bound),self:pos(ifScope)) trueBlock,falseBlock=lBlock,rBlock else condition=Ast.GreaterThanExpression(self:pos(ifScope),Ast.NumberExpression(bound)) trueBlock,falseBlock=rBlock,lBlock end return Ast.Block({Ast.IfStatement(condition,trueBlock,{},falseBlock)},ifScope) end
-  local whileBody=buildElseifChain(blocks,1,#blocks,self.containerFuncScope) if self.whileScope then self.whileScope:setParent(self.containerFuncScope) end self.whileScope:addReferenceToHigherScope(self.containerFuncScope,self.returnVar,1) self.whileScope:addReferenceToHigherScope(self.containerFuncScope,self.posVar) self.containerFuncScope:addReferenceToHigherScope(self.scope,self.unpackVar) local declarations={self.returnVar} for i,var in pairs(self.registerVars) do if i~=MAX_REGS then table.insert(declarations,var) end end local stats={} if self.maxUsedRegister>=MAX_REGS then table.insert(stats,Ast.LocalVariableDeclaration(self.containerFuncScope,{self.registerVars[MAX_REGS]},{Ast.TableConstructorExpression({})})) end table.insert(stats,Ast.LocalVariableDeclaration(self.containerFuncScope,util.shuffle(declarations),{})) table.insert(stats,Ast.WhileStatement(whileBody,Ast.VariableExpression(self.containerFuncScope,self.posVar))) table.insert(stats,Ast.AssignmentStatement({Ast.AssignmentVariable(self.containerFuncScope,self.posVar)},{Ast.LenExpression(Ast.VariableExpression(self.containerFuncScope,self.detectGcCollectVar))})) table.insert(stats,Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.unpackVar),{Ast.VariableExpression(self.containerFuncScope,self.returnVar)})}) return Ast.Block(stats,self.containerFuncScope) end
-end
-_MODULES["prometheus.compiler.emit"] = function() return require("prometheus.compiler.emit") end
-
--- compiler/compile_core
-do
-local compileTop = require("prometheus.compiler.compile_top")
-local statementHandlers = require("prometheus.compiler.statements")
-local expressionHandlers = require("prometheus.compiler.expressions")
-local Ast = require("prometheus.ast")
-local logger = require("logger")
-return function(Compiler)
-  compileTop(Compiler)
-  function Compiler:compileStatement(statement,funcDepth) local handler=statementHandlers[statement.kind] if handler then handler(self,statement,funcDepth) return end logger:error(string.format("%s is not a compileable statement!",statement.kind)) end
-  function Compiler:compileExpression(expression,funcDepth,numReturns) local handler=expressionHandlers[expression.kind] if handler then return handler(self,expression,funcDepth,numReturns) end logger:error(string.format("%s is not an compliable expression!",expression.kind)) end
-end
-_MODULES["prometheus.compiler.compile_core"] = function() return require("prometheus.compiler.compile_core") end
-
--- compiler/compile_top
-do
-local Ast = require("prometheus.ast")
 local util = require("prometheus.util")
-local visitast = require("prometheus.visitast")
-local lookupify = util.lookupify
-local AstKind = Ast.AstKind
-return function(Compiler)
-  function Compiler:compileTopNode(node) local startBlock=self:createBlock() local scope=startBlock.scope self.startBlockId=startBlock.id self:setActiveBlock(startBlock) local varAccessLookup=lookupify{AstKind.AssignmentVariable,AstKind.VariableExpression,AstKind.FunctionDeclaration,AstKind.LocalFunctionDeclaration} local functionLookup=lookupify{AstKind.FunctionDeclaration,AstKind.LocalFunctionDeclaration,AstKind.FunctionLiteralExpression,AstKind.TopNode} visitast(node,function(node,data) if node.kind==AstKind.Block then node.scope.__depth=data.functionData.depth end if varAccessLookup[node.kind] then if not node.scope.isGlobal then if node.scope.__depth<data.functionData.depth then if not self:isUpvalue(node.scope,node.id) then self:makeUpvalue(node.scope,node.id) end end end end end,nil,nil) self.varargReg=self:allocRegister(true) scope:addReferenceToHigherScope(self.containerFuncScope,self.argsVar) scope:addReferenceToHigherScope(self.scope,self.selectVar) scope:addReferenceToHigherScope(self.scope,self.unpackVar) self:addStatement(self:setRegister(scope,self.varargReg,Ast.VariableExpression(self.containerFuncScope,self.argsVar)),{self.varargReg},{},false) self:compileBlock(node.body,0) if self.activeBlock.advanceToNextBlock then self:addStatement(self:setPos(self.activeBlock.scope,nil),{self.POS_REGISTER},{},false) self:addStatement(self:setReturn(self.activeBlock.scope,Ast.TableConstructorExpression({})),{self.RETURN_REGISTER},{},false) self.activeBlock.advanceToNextBlock=false end self:resetRegisters() end
-  function Compiler:compileFunction(node,funcDepth) funcDepth=funcDepth+1 local oldActiveBlock=self.activeBlock local upperVarargReg=self.varargReg self.varargReg=nil local upvalueExpressions={} local upvalueIds={} local usedRegs={} local oldGetUpvalueId=self.getUpvalueId self.getUpvalueId=function(self,scope,id) if not upvalueIds[scope] then upvalueIds[scope]={} end if upvalueIds[scope][id] then return upvalueIds[scope][id] end local scopeFuncDepth=self.scopeFunctionDepths[scope] local expression if scopeFuncDepth==funcDepth then oldActiveBlock.scope:addReferenceToHigherScope(self.scope,self.allocUpvalFunction) expression=Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.allocUpvalFunction),{}) elseif scopeFuncDepth==funcDepth-1 then local varReg=self:getVarRegister(scope,id,scopeFuncDepth,nil) expression=self:register(oldActiveBlock.scope,varReg) table.insert(usedRegs,varReg) else local higherId=oldGetUpvalueId(self,scope,id) oldActiveBlock.scope:addReferenceToHigherScope(self.containerFuncScope,self.currentUpvaluesVar) expression=Ast.IndexExpression(Ast.VariableExpression(self.containerFuncScope,self.currentUpvaluesVar),Ast.NumberExpression(higherId)) end table.insert(upvalueExpressions,Ast.TableEntry(expression)) local uid=#upvalueExpressions upvalueIds[scope][id]=uid return uid end local block=self:createBlock() self:setActiveBlock(block) local scope=self.activeBlock.scope self:pushRegisterUsageInfo() for i,arg in ipairs(node.args) do if arg.kind==AstKind.VariableExpression then if self:isUpvalue(arg.scope,arg.id) then scope:addReferenceToHigherScope(self.scope,self.allocUpvalFunction) local argReg=self:getVarRegister(arg.scope,arg.id,funcDepth,nil) self:addStatement(self:setRegister(scope,argReg,Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.allocUpvalFunction),{})),{argReg},{},false) self:addStatement(self:setUpvalueMember(scope,self:register(scope,argReg),Ast.IndexExpression(Ast.VariableExpression(self.containerFuncScope,self.argsVar),Ast.NumberExpression(i))),{},{argReg},true) else local argReg=self:getVarRegister(arg.scope,arg.id,funcDepth,nil) scope:addReferenceToHigherScope(self.containerFuncScope,self.argsVar) self:addStatement(self:setRegister(scope,argReg,Ast.IndexExpression(Ast.VariableExpression(self.containerFuncScope,self.argsVar),Ast.NumberExpression(i))),{argReg},{},false) end else self.varargReg=self:allocRegister(true) scope:addReferenceToHigherScope(self.containerFuncScope,self.argsVar) scope:addReferenceToHigherScope(self.scope,self.selectVar) scope:addReferenceToHigherScope(self.scope,self.unpackVar) self:addStatement(self:setRegister(scope,self.varargReg,Ast.TableConstructorExpression({Ast.TableEntry(Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.selectVar),{Ast.NumberExpression(i),Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.unpackVar),{Ast.VariableExpression(self.containerFuncScope,self.argsVar)})}))})),{self.varargReg},{},false) end end self:compileBlock(node.body,funcDepth) if self.activeBlock.advanceToNextBlock then self:addStatement(self:setPos(self.activeBlock.scope,nil),{self.POS_REGISTER},{},false) self:addStatement(self:setReturn(self.activeBlock.scope,Ast.TableConstructorExpression({})),{self.RETURN_REGISTER},{},false) self.activeBlock.advanceToNextBlock=false end if self.varargReg then self:freeRegister(self.varargReg,true) end self.varargReg=upperVarargReg self.getUpvalueId=oldGetUpvalueId self:popRegisterUsageInfo() self:setActiveBlock(oldActiveBlock) local scope=self.activeBlock.scope local retReg=self:allocRegister(false) local isVarargFunction=#node.args>0 and node.args[#node.args].kind==AstKind.VarargExpression local retrieveExpression if isVarargFunction then scope:addReferenceToHigherScope(self.scope,self.createVarargClosureVar) retrieveExpression=Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.createVarargClosureVar),{Ast.NumberExpression(block.id),Ast.TableConstructorExpression(upvalueExpressions)}) else local varScope,var=self:getCreateClosureVar(#node.args+math.random(0,5)) scope:addReferenceToHigherScope(varScope,var) retrieveExpression=Ast.FunctionCallExpression(Ast.VariableExpression(varScope,var),{Ast.NumberExpression(block.id),Ast.TableConstructorExpression(upvalueExpressions)}) end self:addStatement(self:setRegister(scope,retReg,retrieveExpression),{retReg},usedRegs,false) return retReg end
-  function Compiler:compileBlock(block,funcDepth) for i,stat in ipairs(block.statements) do self:compileStatement(stat,funcDepth) end local scope=self.activeBlock.scope for id,name in ipairs(block.scope.variables) do local varReg=self:getVarRegister(block.scope,id,funcDepth,nil) if self:isUpvalue(block.scope,id) then scope:addReferenceToHigherScope(self.scope,self.freeUpvalueFunc) self:addStatement(self:setRegister(scope,varReg,Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.freeUpvalueFunc),{self:register(scope,varReg)})),{varReg},{varReg},false) else self:addStatement(self:setRegister(scope,varReg,Ast.NilExpression()),{varReg},{},false) end self:freeRegister(varReg,true) end end
-end
-_MODULES["prometheus.compiler.compile_top"] = function() return require("prometheus.compiler.compile_top") end
 
--- compiler/statements
+function passes.RenameVariables(ast, settings)
+    ast.globalScope:renameVariables(settings)
+end
+
+function passes.EncryptStrings(ast)
+    local key = math.random(1, 255)
+    local function encrypt(str)
+        local bytes = {string.byte(str, 1, #str)}
+        for i, b in ipairs(bytes) do
+            bytes[i] = string.char(b ~ key)
+        end
+        return table.concat(bytes)
+    end
+
+    local function visit(node, parent, index)
+        if node.kind == AstKind.StringExpression then
+            local encrypted = encrypt(node.value)
+            local decodeFunc = Ast.FunctionLiteralExpression(
+                {"s"},
+                Ast.Block({
+                    Ast.LocalVariableDeclaration(nil, {1}, {Ast.NumberExpression(key)}),
+                    Ast.ReturnStatement({
+                        Ast.FunctionCallExpression(
+                            Ast.IndexExpression(Ast.VariableExpression(nil, nil) -- placeholder, sẽ sửa sau
+                            , nil)
+                        , {Ast.StringExpression(encrypted)})
+                    })
+                }, nil)
+            )
+            -- Thay thế bằng một hàm gọi decode tại chỗ
+            local newCall = Ast.FunctionCallExpression(
+                decodeFunc,
+                {Ast.StringExpression(encrypted)}
+            )
+            if parent then
+                if type(index) == "number" then
+                    parent[index] = newCall
+                elseif index then
+                    parent[index] = newCall
+                end
+            end
+        end
+        if node.kind == AstKind.Block then
+            for i, stmt in ipairs(node.statements) do
+                visit(stmt, node.statements, i)
+            end
+        end
+    end
+
+    visit(ast.body, nil, nil)
+end
+
+function passes.ShuffleStatements(ast)
+    local function isSafeBlock(block)
+        if block.kind ~= AstKind.Block then return false end
+        for _, stmt in ipairs(block.statements) do
+            if stmt.kind == AstKind.ReturnStatement or stmt.kind == AstKind.BreakStatement or stmt.kind == AstKind.ContinueStatement then
+                return false
+            end
+        end
+        return true
+    end
+
+    local function visit(node)
+        if node.kind == AstKind.Block then
+            if isSafeBlock(node) then
+                util.shuffle(node.statements)
+            end
+            for _, stmt in ipairs(node.statements) do
+                visit(stmt)
+            end
+        elseif node.kind == AstKind.IfStatement then
+            visit(node.body)
+            if node.elseifs then for _, eif in ipairs(node.elseifs) do visit(eif.body) end end
+            if node.elsebody then visit(node.elsebody) end
+        elseif node.kind == AstKind.WhileStatement then
+            visit(node.body)
+        elseif node.kind == AstKind.RepeatStatement then
+            visit(node.body)
+        elseif node.kind == AstKind.ForStatement or node.kind == AstKind.ForInStatement then
+            visit(node.body)
+        elseif node.kind == AstKind.FunctionDeclaration then
+            visit(node.body)
+        elseif node.kind == AstKind.LocalFunctionDeclaration then
+            visit(node.body)
+        elseif node.kind == AstKind.DoStatement then
+            visit(node.body)
+        end
+    end
+
+    visit(ast.body)
+end
+
+_MODULES["prometheus.passes"] = function() return passes end
+end
+
+-- main prometheus module
 do
-local Ast = require("prometheus.ast")
-local AstKind = Ast.AstKind
-local handlers={}
-local function requireStatement(name) return require("prometheus.compiler.statements."..name) end
-handlers[AstKind.ReturnStatement]=requireStatement("return")
-handlers[AstKind.LocalVariableDeclaration]=requireStatement("local_variable_declaration")
-handlers[AstKind.FunctionCallStatement]=requireStatement("function_call")
-handlers[AstKind.PassSelfFunctionCallStatement]=requireStatement("pass_self_function_call")
-handlers[AstKind.LocalFunctionDeclaration]=requireStatement("local_function_declaration")
-handlers[AstKind.FunctionDeclaration]=requireStatement("function_declaration")
-handlers[AstKind.AssignmentStatement]=requireStatement("assignment")
-handlers[AstKind.IfStatement]=requireStatement("if_statement")
-handlers[AstKind.DoStatement]=requireStatement("do_statement")
-handlers[AstKind.WhileStatement]=requireStatement("while_statement")
-handlers[AstKind.RepeatStatement]=requireStatement("repeat_statement")
-handlers[AstKind.ForStatement]=requireStatement("for_statement")
-handlers[AstKind.ForInStatement]=requireStatement("for_in_statement")
-handlers[AstKind.BreakStatement]=requireStatement("break_statement")
-handlers[AstKind.ContinueStatement]=requireStatement("continue_statement")
-local compoundHandler=requireStatement("compound")
-handlers[AstKind.CompoundAddStatement]=compoundHandler
-handlers[AstKind.CompoundSubStatement]=compoundHandler
-handlers[AstKind.CompoundMulStatement]=compoundHandler
-handlers[AstKind.CompoundDivStatement]=compoundHandler
-handlers[AstKind.CompoundModStatement]=compoundHandler
-handlers[AstKind.CompoundPowStatement]=compoundHandler
-handlers[AstKind.CompoundConcatStatement]=compoundHandler
-_MODULES["prometheus.compiler.statements"] = function() return handlers end
+local prometheus = {}
+
+function prometheus.obfuscate(code, options)
+    options = options or {}
+    local config = require("config")
+    local logger = require("logger")
+    local Tokenizer = require("prometheus.tokenizer")
+    local Parser = require("prometheus.parser")
+    local Generator = require("prometheus.generator")
+    local passes = require("prometheus.passes")
+    local Enums = require("prometheus.enums")
+
+    local tokenizer = Tokenizer:new({luaVersion = options.LuaVersion or "Lua51"})
+    tokenizer:append(code)
+    local parser = Parser:new(tokenizer, {SimplifyConstants = options.SimplifyConstants ~= false})
+    local ast = parser:parse()
+
+    if options.RenameVariables then
+        local keywords = options.LuaVersion == "LuaU" and Enums.Conventions.LuaU.Keywords or Enums.Conventions.Lua51.Keywords
+        passes.RenameVariables(ast, {
+            Keywords = keywords,
+            generateName = function(i, scope, orig)
+                local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                if i <= #chars then
+                    return chars:sub(i, i)
+                else
+                    return "_" .. tostring(i)
+                end
+            end,
+            prefix = "",
+        })
+    end
+
+    if options.EncryptStrings then
+        passes.EncryptStrings(ast)
+    end
+
+    if options.ShuffleStatements then
+        passes.ShuffleStatements(ast)
+    end
+
+    local generator = Generator:new(ast, {})
+    return generator:generate()
 end
 
--- compiler/expressions
-do
-local Ast = require("prometheus.ast")
-local AstKind = Ast.AstKind
-local handlers={}
-local function requireExpression(name) return require("prometheus.compiler.expressions."..name) end
-handlers[AstKind.StringExpression]=requireExpression("string")
-handlers[AstKind.NumberExpression]=requireExpression("number")
-handlers[AstKind.BooleanExpression]=requireExpression("boolean")
-handlers[AstKind.NilExpression]=requireExpression("nil")
-handlers[AstKind.VariableExpression]=requireExpression("variable")
-handlers[AstKind.FunctionCallExpression]=requireExpression("function_call")
-handlers[AstKind.PassSelfFunctionCallExpression]=requireExpression("pass_self_function_call")
-handlers[AstKind.IndexExpression]=requireExpression("index")
-handlers[AstKind.NotExpression]=requireExpression("not")
-handlers[AstKind.NegateExpression]=requireExpression("negate")
-handlers[AstKind.LenExpression]=requireExpression("len")
-handlers[AstKind.OrExpression]=requireExpression("or")
-handlers[AstKind.AndExpression]=requireExpression("and")
-handlers[AstKind.TableConstructorExpression]=requireExpression("table_constructor")
-handlers[AstKind.FunctionLiteralExpression]=requireExpression("function_literal")
-handlers[AstKind.VarargExpression]=requireExpression("vararg")
-handlers[AstKind.IfElseExpression]=requireExpression("if_else")
-local binaryHandler=requireExpression("binary")
-handlers[AstKind.LessThanExpression]=binaryHandler
-handlers[AstKind.GreaterThanExpression]=binaryHandler
-handlers[AstKind.LessThanOrEqualsExpression]=binaryHandler
-handlers[AstKind.GreaterThanOrEqualsExpression]=binaryHandler
-handlers[AstKind.NotEqualsExpression]=binaryHandler
-handlers[AstKind.EqualsExpression]=binaryHandler
-handlers[AstKind.StrCatExpression]=binaryHandler
-handlers[AstKind.AddExpression]=binaryHandler
-handlers[AstKind.SubExpression]=binaryHandler
-handlers[AstKind.MulExpression]=binaryHandler
-handlers[AstKind.DivExpression]=binaryHandler
-handlers[AstKind.ModExpression]=binaryHandler
-handlers[AstKind.PowExpression]=binaryHandler
-_MODULES["prometheus.compiler.expressions"] = function() return handlers end
+_MODULES["prometheus"] = function() return prometheus end
 end
 
--- compiler/compiler main
-do
-local Ast = require("prometheus.ast")
-local Scope = require("prometheus.scope")
-local util = require("prometheus.util")
-local lookupify = util.lookupify
-local AstKind = Ast.AstKind
-local unpack = unpack or table.unpack
-local blockModule = require("prometheus.compiler.block")
-local registerModule = require("prometheus.compiler.register")
-local upvalueModule = require("prometheus.compiler.upvalue")
-local emitModule = require("prometheus.compiler.emit")
-local compileCoreModule = require("prometheus.compiler.compile_core")
-local Compiler = {}
-function Compiler:new() local c={blocks={},registers={},activeBlock=nil,registersForVar={},usedRegisters=0,maxUsedRegister=0,registerVars={},VAR_REGISTER=newproxy(false),RETURN_ALL=newproxy(false),POS_REGISTER=newproxy(false),RETURN_REGISTER=newproxy(false),UPVALUE=newproxy(false),BIN_OPS=lookupify{AstKind.LessThanExpression,AstKind.GreaterThanExpression,AstKind.LessThanOrEqualsExpression,AstKind.GreaterThanOrEqualsExpression,AstKind.NotEqualsExpression,AstKind.EqualsExpression,AstKind.StrCatExpression,AstKind.AddExpression,AstKind.SubExpression,AstKind.MulExpression,AstKind.DivExpression,AstKind.ModExpression,AstKind.PowExpression}} setmetatable(c,self) self.__index=self return c end
-blockModule(Compiler) registerModule(Compiler) upvalueModule(Compiler) emitModule(Compiler) compileCoreModule(Compiler)
-function Compiler:pushRegisterUsageInfo() table.insert(self.registerUsageStack,{usedRegisters=self.usedRegisters,registers=self.registers}) self.usedRegisters=0 self.registers={} end
-function Compiler:popRegisterUsageInfo() local info=table.remove(self.registerUsageStack) self.usedRegisters=info.usedRegisters self.registers=info.registers end
-function Compiler:compile(ast) self.blocks={} self.registers={} self.activeBlock=nil self.registersForVar={} self.scopeFunctionDepths={} self.maxUsedRegister=0 self.usedRegisters=0 self.registerVars={} self.usedBlockIds={} self.upvalVars={} self.registerUsageStack={} self.upvalsProxyLenReturn=math.random(-2^22,2^22) local newGlobalScope=Scope:newGlobal() local psc=Scope:new(newGlobalScope,nil) local _,getfenvVar=newGlobalScope:resolve("getfenv") local _,tableVar=newGlobalScope:resolve("table") local _,unpackVar=newGlobalScope:resolve("unpack") local _,envVar=newGlobalScope:resolve("_ENV") local _,newproxyVar=newGlobalScope:resolve("newproxy") local _,setmetatableVar=newGlobalScope:resolve("setmetatable") local _,getmetatableVar=newGlobalScope:resolve("getmetatable") local _,selectVar=newGlobalScope:resolve("select") psc:addReferenceToHigherScope(newGlobalScope,getfenvVar,2) psc:addReferenceToHigherScope(newGlobalScope,tableVar) psc:addReferenceToHigherScope(newGlobalScope,unpackVar) psc:addReferenceToHigherScope(newGlobalScope,envVar) psc:addReferenceToHigherScope(newGlobalScope,newproxyVar) psc:addReferenceToHigherScope(newGlobalScope,setmetatableVar) psc:addReferenceToHigherScope(newGlobalScope,getmetatableVar) self.scope=Scope:new(psc) self.envVar=self.scope:addVariable() self.containerFuncVar=self.scope:addVariable() self.unpackVar=self.scope:addVariable() self.newproxyVar=self.scope:addVariable() self.setmetatableVar=self.scope:addVariable() self.getmetatableVar=self.scope:addVariable() self.selectVar=self.scope:addVariable() local argVar=self.scope:addVariable() self.containerFuncScope=Scope:new(self.scope) self.whileScope=Scope:new(self.containerFuncScope) self.posVar=self.containerFuncScope:addVariable() self.argsVar=self.containerFuncScope:addVariable() self.currentUpvaluesVar=self.containerFuncScope:addVariable() self.detectGcCollectVar=self.containerFuncScope:addVariable() self.returnVar=self.containerFuncScope:addVariable() self.upvaluesTable=self.scope:addVariable() self.upvaluesReferenceCountsTable=self.scope:addVariable() self.allocUpvalFunction=self.scope:addVariable() self.currentUpvalId=self.scope:addVariable() self.upvaluesProxyFunctionVar=self.scope:addVariable() self.upvaluesGcFunctionVar=self.scope:addVariable() self.freeUpvalueFunc=self.scope:addVariable() self.createClosureVars={} self.createVarargClosureVar=self.scope:addVariable() local createClosureScope=Scope:new(self.scope) local createClosurePosArg=createClosureScope:addVariable() local createClosureUpvalsArg=createClosureScope:addVariable() local createClosureProxyObject=createClosureScope:addVariable() local createClosureFuncVar=createClosureScope:addVariable() local createClosureSubScope=Scope:new(createClosureScope) local upvalEntries={} local upvalueIds={} self.getUpvalueId=function(self,scope,id) local expression local scopeFuncDepth=self.scopeFunctionDepths[scope] if scopeFuncDepth==0 then if upvalueIds[id] then return upvalueIds[id] end expression=Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.allocUpvalFunction),{}) else require("logger"):error("Unresolved Upvalue, this error should not occur!") end table.insert(upvalEntries,Ast.TableEntry(expression)) local uid=#upvalEntries upvalueIds[id]=uid return uid end createClosureSubScope:addReferenceToHigherScope(self.scope,self.containerFuncVar) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosurePosArg) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosureUpvalsArg,1) createClosureScope:addReferenceToHigherScope(self.scope,self.upvaluesProxyFunctionVar) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosureProxyObject) self:compileTopNode(ast) local functionNodeAssignments={ {var=Ast.AssignmentVariable(self.scope,self.containerFuncVar),val=Ast.FunctionLiteralExpression({Ast.VariableExpression(self.containerFuncScope,self.posVar),Ast.VariableExpression(self.containerFuncScope,self.argsVar),Ast.VariableExpression(self.containerFuncScope,self.currentUpvaluesVar),Ast.VariableExpression(self.containerFuncScope,self.detectGcCollectVar)},self:emitContainerFuncBody())}, {var=Ast.AssignmentVariable(self.scope,self.createVarargClosureVar),val=Ast.FunctionLiteralExpression({Ast.VariableExpression(createClosureScope,createClosurePosArg),Ast.VariableExpression(createClosureScope,createClosureUpvalsArg)},Ast.Block({Ast.LocalVariableDeclaration(createClosureScope,{createClosureProxyObject},{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),{Ast.VariableExpression(createClosureScope,createClosureUpvalsArg)})}),Ast.LocalVariableDeclaration(createClosureScope,{createClosureFuncVar},{Ast.FunctionLiteralExpression({Ast.VarargExpression()},Ast.Block({Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.containerFuncVar),{Ast.VariableExpression(createClosureScope,createClosurePosArg),Ast.TableConstructorExpression({Ast.TableEntry(Ast.VarargExpression())}),Ast.VariableExpression(createClosureScope,createClosureUpvalsArg),Ast.VariableExpression(createClosureScope,createClosureProxyObject)})}},createClosureSubScope))}),Ast.ReturnStatement{Ast.VariableExpression(createClosureScope,createClosureFuncVar)}},createClosureScope))}, {var=Ast.AssignmentVariable(self.scope,self.upvaluesTable),val=Ast.TableConstructorExpression({})}, {var=Ast.AssignmentVariable(self.scope,self.upvaluesReferenceCountsTable),val=Ast.TableConstructorExpression({})}, {var=Ast.AssignmentVariable(self.scope,self.allocUpvalFunction),val=self:createAllocUpvalFunction()}, {var=Ast.AssignmentVariable(self.scope,self.currentUpvalId),val=Ast.NumberExpression(0)}, {var=Ast.AssignmentVariable(self.scope,self.upvaluesProxyFunctionVar),val=self:createUpvaluesProxyFunc()}, {var=Ast.AssignmentVariable(self.scope,self.upvaluesGcFunctionVar),val=self:createUpvaluesGcFunc()}, {var=Ast.AssignmentVariable(self.scope,self.freeUpvalueFunc),val=self:createFreeUpvalueFunc()}, } local tbl={Ast.VariableExpression(self.scope,self.containerFuncVar),Ast.VariableExpression(self.scope,self.createVarargClosureVar),Ast.VariableExpression(self.scope,self.upvaluesTable),Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),Ast.VariableExpression(self.scope,self.allocUpvalFunction),Ast.VariableExpression(self.scope,self.currentUpvalId),Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),Ast.VariableExpression(self.scope,self.upvaluesGcFunctionVar),Ast.VariableExpression(self.scope,self.freeUpvalueFunc)} for _,entry in pairs(self.createClosureVars) do table.insert(functionNodeAssignments,entry) table.insert(tbl,Ast.VariableExpression(entry.var.scope,entry.var.id)) end util.shuffle(functionNodeAssignments) local assignmentStatLhs,assignmentStatRhs={},{} for i,v in ipairs(functionNodeAssignments) do assignmentStatLhs[i]=v.var assignmentStatRhs[i]=v.val end local ids=util.shuffle({1,2,3,4,5,6,7}) local items={Ast.VariableExpression(self.scope,self.envVar),Ast.VariableExpression(self.scope,self.unpackVar),Ast.VariableExpression(self.scope,self.newproxyVar),Ast.VariableExpression(self.scope,self.setmetatableVar),Ast.VariableExpression(self.scope,self.getmetatableVar),Ast.VariableExpression(self.scope,self.selectVar),Ast.VariableExpression(self.scope,argVar)} local astItems={Ast.OrExpression(Ast.AndExpression(Ast.VariableExpression(newGlobalScope,getfenvVar),Ast.FunctionCallExpression(Ast.VariableExpression(newGlobalScope,getfenvVar),{})),Ast.VariableExpression(newGlobalScope,envVar)),Ast.OrExpression(Ast.VariableExpression(newGlobalScope,unpackVar),Ast.IndexExpression(Ast.VariableExpression(newGlobalScope,tableVar),Ast.StringExpression("unpack"))),Ast.VariableExpression(newGlobalScope,newproxyVar),Ast.VariableExpression(newGlobalScope,setmetatableVar),Ast.VariableExpression(newGlobalScope,getmetatableVar),Ast.VariableExpression(newGlobalScope,selectVar),Ast.TableConstructorExpression({Ast.TableEntry(Ast.VarargExpression())})} local functionNode=Ast.FunctionLiteralExpression({items[ids[1]],items[ids[2]],items[ids[3]],items[ids[4]],items[ids[5]],items[ids[6]],items[ids[7]],unpack(util.shuffle(tbl))},Ast.Block({Ast.AssignmentStatement(assignmentStatLhs,assignmentStatRhs),Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.createVarargClosureVar),{Ast.NumberExpression(self.startBlockId),Ast.TableConstructorExpression(upvalEntries)}),{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.unpackVar),{Ast.VariableExpression(self.scope,argVar)})})}},self.scope)) return Ast.TopNode(Ast.Block({Ast.ReturnStatement{Ast.FunctionCallExpression(functionNode,{astItems[ids[1]],astItems[ids[2]],astItems[ids[3]],astItems[ids[4]],astItems[ids[5]],astItems[ids[6]],astItems[ids[7]]})}},psc),newGlobalScope) end
-function Compiler:getCreateClosureVar(argCount) if not self.createClosureVars[argCount] then local var=Ast.AssignmentVariable(self.scope,self.scope:addVariable()) local createClosureScope=Scope:new(self.scope) local createClosureSubScope=Scope:new(createClosureScope) local createClosurePosArg=createClosureScope:addVariable() local createClosureUpvalsArg=createClosureScope:addVariable() local createClosureProxyObject=createClosureScope:addVariable() local createClosureFuncVar=createClosureScope:addVariable() createClosureSubScope:addReferenceToHigherScope(self.scope,self.containerFuncVar) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosurePosArg) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosureUpvalsArg,1) createClosureScope:addReferenceToHigherScope(self.scope,self.upvaluesProxyFunctionVar) createClosureSubScope:addReferenceToHigherScope(createClosureScope,createClosureProxyObject) local argsTb,argsTb2={},{} for i=1,argCount do local arg=createClosureSubScope:addVariable() argsTb[i]=Ast.VariableExpression(createClosureSubScope,arg) argsTb2[i]=Ast.TableEntry(Ast.VariableExpression(createClosureSubScope,arg)) end local val=Ast.FunctionLiteralExpression({Ast.VariableExpression(createClosureScope,createClosurePosArg),Ast.VariableExpression(createClosureScope,createClosureUpvalsArg)},Ast.Block({Ast.LocalVariableDeclaration(createClosureScope,{createClosureProxyObject},{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),{Ast.VariableExpression(createClosureScope,createClosureUpvalsArg)})}),Ast.LocalVariableDeclaration(createClosureScope,{createClosureFuncVar},{Ast.FunctionLiteralExpression(argsTb,Ast.Block({Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.containerFuncVar),{Ast.VariableExpression(createClosureScope,createClosurePosArg),Ast.TableConstructorExpression(argsTb2),Ast.VariableExpression(createClosureScope,createClosureUpvalsArg),Ast.VariableExpression(createClosureScope,createClosureProxyObject)})}},createClosureSubScope))}),Ast.ReturnStatement{Ast.VariableExpression(createClosureScope,createClosureFuncVar)}},createClosureScope)) self.createClosureVars[argCount]={var=var,val=val} end local var=self.createClosureVars[argCount].var return var.scope,var.id end
-_MODULES["prometheus.compiler.compiler"] = function() return Compiler end
-end
-
--- final obfuscate function
-local function obfuscate(code)
-  local Presets = require("presets")
-  local Pipeline = require("prometheus.pipeline")
-  local pipeline = Pipeline:fromConfig(Presets.Minify)
-  return pipeline:apply(code, "input")
-end
-
-return obfuscate
+return require("prometheus")
