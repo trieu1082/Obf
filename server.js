@@ -12,7 +12,6 @@ app.use(express.static("public"))
 
 if (!fs.existsSync("pastes")) fs.mkdirSync("pastes")
 
-// Đọc file obfuscator.lua
 const LUA_SCRIPT = fs.readFileSync("obfuscator.lua", "utf8")
 console.log("✅ Loaded obfuscator.lua, length:", LUA_SCRIPT.length)
 
@@ -23,13 +22,14 @@ app.post("/obf", upload.single("file"), (req, res) => {
 
   const tmpFile = `/tmp/obf_${nanoid(8)}.lua`
   fs.writeFileSync(tmpFile, LUA_SCRIPT)
+
   let obfCode
   try {
-    // Dùng lua5.4 thay vì lua (vì Docker cài lua5.4)
-    obfCode = execSync(`lua5.4 ${tmpFile}`, {
+    // Gọi tuyệt đối /usr/bin/lua (đã được symlink trong Docker)
+    obfCode = execSync(`/usr/bin/lua ${tmpFile}`, {
       input: code,
       encoding: "utf8",
-      timeout: 10000, // 10 giây timeout
+      timeout: 10000,
     })
   } catch (e) {
     console.error("❌ Lua error:", e.message)
@@ -44,7 +44,7 @@ app.post("/obf", upload.single("file"), (req, res) => {
   res.json({
     code: obfCode,
     download: `/download/${id}`,
-    link: `/view/${id}`
+    link: `/view/${id}`,
   })
 })
 
